@@ -22,6 +22,7 @@ subclassing the :class:`_orm.DeclarativeBase` superclass::
 
     from sqlalchemy.orm import DeclarativeBase
 
+
     # declarative base class
     class Base(DeclarativeBase):
         pass
@@ -50,6 +51,7 @@ With the declarative base class, new mapped classes are declared as subclasses
 of the base::
 
     from datetime import datetime
+    from typing import List
     from typing import Optional
 
     from sqlalchemy import ForeignKey

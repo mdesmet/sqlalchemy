@@ -40,6 +40,7 @@ typed by hand.
 .. versionadded:: 2.0
 
 """
+
 # mypy: ignore-errors
 
 from __future__ import annotations
@@ -85,9 +86,9 @@ class _repr_sym:
         return self.sym
 
 
-classes: collections.defaultdict[
-    str, Dict[str, Tuple[Any, ...]]
-] = collections.defaultdict(dict)
+classes: collections.defaultdict[str, Dict[str, Tuple[Any, ...]]] = (
+    collections.defaultdict(dict)
+)
 
 _T = TypeVar("_T", bound="Any")
 
@@ -99,6 +100,7 @@ def create_proxy_methods(
     classmethods: Iterable[str] = (),
     methods: Iterable[str] = (),
     attributes: Iterable[str] = (),
+    use_intermediate_variable: Iterable[str] = (),
 ) -> Callable[[Type[_T]], Type[_T]]:
     """A class decorator that will copy attributes to a proxy class.
 
@@ -120,6 +122,7 @@ def create_proxy_methods(
             classmethods,
             methods,
             attributes,
+            use_intermediate_variable,
             cls,
         )
         return cls
@@ -180,9 +183,9 @@ def process_class(
     classmethods: Iterable[str],
     methods: Iterable[str],
     attributes: Iterable[str],
+    use_intermediate_variable: Iterable[str],
     cls: Type[Any],
 ):
-
     sphinx_symbol_match = re.match(r":class:`(.+)`", target_cls_sphinx_name)
     if not sphinx_symbol_match:
         raise Exception(
@@ -192,6 +195,8 @@ def process_class(
         )
 
     sphinx_symbol = sphinx_symbol_match.group(1)
+
+    require_intermediate = set(use_intermediate_variable)
 
     def instrument(buf: TextIO, name: str, clslevel: bool = False) -> None:
         fn = getattr(target_cls, name)
@@ -210,18 +215,22 @@ def process_class(
 
             if spec.defaults:
                 new_defaults = tuple(
-                    _repr_sym("util.EMPTY_DICT")
-                    if df is util.EMPTY_DICT
-                    else df
+                    (
+                        _repr_sym("util.EMPTY_DICT")
+                        if df is util.EMPTY_DICT
+                        else df
+                    )
                     for df in spec.defaults
                 )
                 elem[3] = new_defaults
 
             if spec.kwonlydefaults:
                 new_kwonlydefaults = {
-                    name: _repr_sym("util.EMPTY_DICT")
-                    if df is util.EMPTY_DICT
-                    else df
+                    name: (
+                        _repr_sym("util.EMPTY_DICT")
+                        if df is util.EMPTY_DICT
+                        else df
+                    )
                     for name, df in spec.kwonlydefaults.items()
                 }
                 elem[5] = new_kwonlydefaults
@@ -256,19 +265,34 @@ def process_class(
             ).lstrip(),
         }
 
+        if fn.__name__ in require_intermediate:
+            metadata["line_prefix"] = "result ="
+            metadata["after_line"] = "return result\n"
+        else:
+            metadata["line_prefix"] = "return"
+            metadata["after_line"] = ""
+
         if clslevel:
             code = (
-                "@classmethod\n"
-                "%(async)sdef %(name)s%(grouped_args)s:\n"
-                '    r"""%(doc)s\n    """  # noqa: E501\n\n'
-                "    return %(await)s%(target_cls_name)s.%(name)s(%(apply_kw_proxied)s)\n\n"  # noqa: E501
+                '''\
+@classmethod
+%(async)sdef %(name)s%(grouped_args)s:
+    r"""%(doc)s\n    """  # noqa: E501
+
+    %(line_prefix)s %(await)s%(target_cls_name)s.%(name)s(%(apply_kw_proxied)s)
+    %(after_line)s
+'''
                 % metadata
             )
         else:
             code = (
-                "%(async)sdef %(name)s%(grouped_args)s:\n"
-                '    r"""%(doc)s\n    """  # noqa: E501\n\n'
-                "    return %(await)s%(self_arg)s._proxied.%(name)s(%(apply_kw_proxied)s)\n\n"  # noqa: E501
+                '''\
+%(async)sdef %(name)s%(grouped_args)s:
+    r"""%(doc)s\n    """  # noqa: E501
+
+    %(line_prefix)s %(await)s%(self_arg)s._proxied.%(name)s(%(apply_kw_proxied)s)
+    %(after_line)s
+'''  # noqa: E501
                 % metadata
             )
 
@@ -341,18 +365,19 @@ def process_class(
 
 
 def process_module(modname: str, filename: str, cmd: code_writer_cmd) -> str:
-
     class_entries = classes[modname]
 
     # use tempfile in same path as the module, or at least in the
     # current working directory, so that black / zimports use
     # local pyproject.toml
-    with NamedTemporaryFile(
-        mode="w",
-        delete=False,
-        suffix=".py",
-    ) as buf, open(filename) as orig_py:
-
+    with (
+        NamedTemporaryFile(
+            mode="w",
+            delete=False,
+            suffix=".py",
+        ) as buf,
+        open(filename) as orig_py,
+    ):
         in_block = False
         current_clsname = None
         for line in orig_py:
@@ -382,7 +407,6 @@ def process_module(modname: str, filename: str, cmd: code_writer_cmd) -> str:
 
 
 def run_module(modname: str, cmd: code_writer_cmd) -> None:
-
     cmd.write_status(f"importing module {modname}\n")
     mod = importlib.import_module(modname)
     destination_path = mod.__file__
@@ -399,9 +423,9 @@ def main(cmd: code_writer_cmd) -> None:
     from sqlalchemy import util
     from sqlalchemy.util import langhelpers
 
-    util.create_proxy_methods = (
-        langhelpers.create_proxy_methods
-    ) = create_proxy_methods
+    util.create_proxy_methods = langhelpers.create_proxy_methods = (
+        create_proxy_methods
+    )
 
     for entry in entries:
         if cmd.args.module in {"all", entry}:
@@ -416,7 +440,6 @@ entries = [
 ]
 
 if __name__ == "__main__":
-
     cmd = code_writer_cmd(__file__)
 
     with cmd.add_arguments() as parser:

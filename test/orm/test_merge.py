@@ -31,6 +31,7 @@ from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import in_
 from sqlalchemy.testing import not_in
 from sqlalchemy.testing.assertsql import CountStatements
+from sqlalchemy.testing.entities import ComparableEntity
 from sqlalchemy.testing.fixtures import fixture_session
 from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.schema import Table
@@ -639,7 +640,6 @@ class MergeTest(_fixtures.FixtureTest):
         self.load_tracker(Address, load)
 
         with fixture_session(expire_on_commit=False) as sess, sess.begin():
-
             # set up data and save
             u = User(
                 id=7,
@@ -965,7 +965,6 @@ class MergeTest(_fixtures.FixtureTest):
         self.load_tracker(Item, load)
 
         with fixture_session(expire_on_commit=False) as sess:
-
             i1 = Item()
             i1.description = "item 1"
 
@@ -1477,9 +1476,7 @@ class MergeTest(_fixtures.FixtureTest):
             CountStatements(
                 0
                 if load.noload
-                else 1
-                if merge_persistent.merge_persistent
-                else 2
+                else 1 if merge_persistent.merge_persistent else 2
             )
         )
 
@@ -1808,6 +1805,29 @@ class MergeTest(_fixtures.FixtureTest):
         sess.flush()
 
         eq_(sess.query(Address).one(), Address(id=1, email_address="c"))
+
+    def test_merge_all(self):
+        User, users = self.classes.User, self.tables.users
+
+        self.mapper_registry.map_imperatively(User, users)
+        sess = fixture_session()
+        load = self.load_tracker(User)
+
+        ua = User(id=42, name="bob")
+        ub = User(id=7, name="fred")
+        eq_(load.called, 0)
+        uam, ubm = sess.merge_all([ua, ub])
+        eq_(load.called, 2)
+        assert uam in sess
+        assert ubm in sess
+        eq_(uam, User(id=42, name="bob"))
+        eq_(ubm, User(id=7, name="fred"))
+        sess.flush()
+        sess.expunge_all()
+        eq_(
+            sess.query(User).order_by("id").all(),
+            [User(id=7, name="fred"), User(id=42, name="bob")],
+        )
 
 
 class M2ONoUseGetLoadingTest(fixtures.MappedTest):
@@ -2183,10 +2203,10 @@ class LoadOnPendingTest(fixtures.MappedTest):
 
     @classmethod
     def setup_classes(cls):
-        class Rock(cls.Basic, fixtures.ComparableEntity):
+        class Rock(cls.Basic, ComparableEntity):
             pass
 
-        class Bug(cls.Basic, fixtures.ComparableEntity):
+        class Bug(cls.Basic, ComparableEntity):
             pass
 
     def _setup_delete_orphan_o2o(self):
@@ -2253,7 +2273,7 @@ class PolymorphicOnTest(fixtures.MappedTest):
 
     @classmethod
     def setup_classes(cls):
-        class Employee(cls.Basic, fixtures.ComparableEntity):
+        class Employee(cls.Basic, ComparableEntity):
             pass
 
         class Manager(Employee):

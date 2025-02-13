@@ -506,7 +506,9 @@ class ExpireTest(_fixtures.FixtureTest):
             users,
             properties={
                 "addresses": relationship(
-                    Address, cascade="all, refresh-expire"
+                    Address,
+                    cascade="all, refresh-expire",
+                    order_by=addresses.c.id,
                 )
             },
         )
@@ -713,7 +715,6 @@ class ExpireTest(_fixtures.FixtureTest):
         sess = fixture_session(autoflush=False)
 
         with self.sql_execution_asserter(testing.db) as asserter:
-
             if case == "contains,joined":
                 a1 = (
                     sess.query(Address)
@@ -1168,7 +1169,6 @@ class ExpireTest(_fixtures.FixtureTest):
                     "with a refresh"
                 ),
             ):
-
                 sess.refresh(u, ["name"])
 
             # id was not expired
@@ -1585,7 +1585,7 @@ class ExpireTest(_fixtures.FixtureTest):
         u1 = sess.query(User).options(defer(User.name)).first()
         assert isinstance(
             attributes.instance_state(u1).callables["name"],
-            strategies.LoadDeferredColumns,
+            strategies._LoadDeferredColumns,
         )
 
         # expire the attr, it gets the InstanceState callable
@@ -1688,7 +1688,7 @@ class ExpireTest(_fixtures.FixtureTest):
         u1 = sess.query(User).options(lazyload(User.addresses)).first()
         assert isinstance(
             attributes.instance_state(u1).callables["addresses"],
-            strategies.LoadLazyAttribute,
+            strategies._LoadLazyAttribute,
         )
         # expire, it goes away from callables as of 1.4 and is considered
         # to be expired
@@ -1712,7 +1712,7 @@ class ExpireTest(_fixtures.FixtureTest):
         )
         assert isinstance(
             attributes.instance_state(u1).callables["addresses"],
-            strategies.LoadLazyAttribute,
+            strategies._LoadLazyAttribute,
         )
 
         # load the attr, goes away

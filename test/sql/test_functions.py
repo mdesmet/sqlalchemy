@@ -26,10 +26,13 @@ from sqlalchemy import Table
 from sqlalchemy import testing
 from sqlalchemy import Text
 from sqlalchemy import true
+from sqlalchemy import Unicode
 from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects import oracle
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import column
 from sqlalchemy.sql import functions
@@ -213,8 +216,45 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
         ]:
             self.assert_compile(func.random(), ret, dialect=dialect)
 
-    def test_cube_operators(self):
+    def test_return_type_aggregate_strings(self):
+        t = table("t", column("value", String))
+        expr = func.aggregate_strings(t.c.value, ",")
+        is_(expr.type._type_affinity, String)
 
+    @testing.combinations(
+        (
+            "SELECT group_concat(t.value, ?) AS aggregate_strings_1 FROM t",
+            "sqlite",
+        ),
+        (
+            "SELECT string_agg(t.value, %(aggregate_strings_2)s) AS "
+            "aggregate_strings_1 FROM t",
+            "postgresql",
+        ),
+        (
+            "SELECT string_agg(t.value, "
+            "__[POSTCOMPILE_aggregate_strings_2]) AS "
+            "aggregate_strings_1 FROM t",
+            "mssql",
+        ),
+        (
+            "SELECT group_concat(t.value SEPARATOR %s) "
+            "AS aggregate_strings_1 FROM t",
+            "mysql",
+        ),
+        (
+            "SELECT LISTAGG(t.value, :aggregate_strings_2) AS"
+            " aggregate_strings_1 FROM t",
+            "oracle",
+        ),
+    )
+    def test_aggregate_strings(self, expected_sql, dialect):
+        t = table("t", column("value", String))
+        stmt = select(func.aggregate_strings(t.c.value, ","))
+
+        self.assert_compile(stmt, expected_sql, dialect=dialect)
+
+    def test_cube_operators(self):
         t = table(
             "t",
             column("value"),
@@ -456,7 +496,6 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
         assert_raises(TypeError, func.char_length)
 
     def test_return_type_detection(self):
-
         for fn in [func.coalesce, func.max, func.min, func.sum]:
             for args, type_ in [
                 (
@@ -805,7 +844,30 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             "AS anon_1 FROM mytable",
         )
 
+    def test_funcfilter_more_criteria(self):
+        ff = func.rank().filter(table1.c.name > "foo")
+        ff2 = ff.filter(table1.c.myid == 1)
+        self.assert_compile(
+            select(ff, ff2),
+            "SELECT rank() FILTER (WHERE mytable.name > :name_1) AS anon_1, "
+            "rank() FILTER (WHERE mytable.name > :name_1 AND "
+            "mytable.myid = :myid_1) AS anon_2 FROM mytable",
+            {"name_1": "foo", "myid_1": 1},
+        )
+
     def test_funcfilter_within_group(self):
+        self.assert_compile(
+            select(
+                func.rank()
+                .filter(table1.c.name > "foo")
+                .within_group(table1.c.name)
+            ),
+            "SELECT rank() FILTER (WHERE mytable.name > :name_1) "
+            "WITHIN GROUP (ORDER BY mytable.name) "
+            "AS anon_1 FROM mytable",
+        )
+
+    def test_within_group(self):
         stmt = select(
             table1.c.myid,
             func.percentile_cont(0.5).within_group(table1.c.name),
@@ -819,7 +881,7 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             {"percentile_cont_1": 0.5},
         )
 
-    def test_funcfilter_within_group_multi(self):
+    def test_within_group_multi(self):
         stmt = select(
             table1.c.myid,
             func.percentile_cont(0.5).within_group(
@@ -835,7 +897,7 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             {"percentile_cont_1": 0.5},
         )
 
-    def test_funcfilter_within_group_desc(self):
+    def test_within_group_desc(self):
         stmt = select(
             table1.c.myid,
             func.percentile_cont(0.5).within_group(table1.c.name.desc()),
@@ -849,7 +911,7 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             {"percentile_cont_1": 0.5},
         )
 
-    def test_funcfilter_within_group_w_over(self):
+    def test_within_group_w_over(self):
         stmt = select(
             table1.c.myid,
             func.percentile_cont(0.5)
@@ -863,6 +925,23 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
             "OVER (PARTITION BY mytable.description) AS anon_1 "
             "FROM mytable",
             {"percentile_cont_1": 0.5},
+        )
+
+    def test_within_group_filter(self):
+        stmt = select(
+            table1.c.myid,
+            func.percentile_cont(0.5)
+            .within_group(table1.c.name)
+            .filter(table1.c.myid > 42),
+        )
+        self.assert_compile(
+            stmt,
+            "SELECT mytable.myid, percentile_cont(:percentile_cont_1) "
+            "WITHIN GROUP (ORDER BY mytable.name) "
+            "FILTER (WHERE mytable.myid > :myid_1) "
+            "AS anon_1 "
+            "FROM mytable",
+            {"percentile_cont_1": 0.5, "myid_1": 42},
         )
 
     def test_incorrect_none_type(self):
@@ -880,7 +959,6 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_as_comparison(self):
-
         fn = func.substring("foo", "foobar").as_comparison(1, 2)
         is_(fn.type._type_affinity, Boolean)
 
@@ -898,7 +976,6 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_as_comparison_annotate(self):
-
         fn = func.foobar("x", "y", "q", "p", "r").as_comparison(2, 5)
 
         from sqlalchemy.sql import annotation
@@ -909,7 +986,6 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
         eq_(fn_annotated.left._annotations, {"token": "yes"})
 
     def test_as_comparison_many_argument(self):
-
         fn = func.some_comparison("x", "y", "z", "p", "q", "r").as_comparison(
             2, 5
         )
@@ -976,8 +1052,6 @@ class ReturnTypeTest(AssertsCompiledSQL, fixtures.TestBase):
         eq_(expr.type.dimensions, col.type.dimensions)
 
     def test_array_agg_array_literal_implicit_type(self):
-        from sqlalchemy.dialects.postgresql import array, ARRAY as PG_ARRAY
-
         expr = array([column("data", Integer), column("d2", Integer)])
 
         assert isinstance(expr.type, PG_ARRAY)
@@ -1162,6 +1236,51 @@ class ExecuteTest(fixtures.TestBase):
             (9, "foo"),
         )
 
+    @testing.variation("unicode_value", [True, False])
+    @testing.variation("unicode_separator", [True, False])
+    def test_aggregate_strings_execute(
+        self, connection, metadata, unicode_value, unicode_separator
+    ):
+        values_t = Table(
+            "values",
+            metadata,
+            Column("value", String(42)),
+            Column("unicode_value", Unicode(42)),
+        )
+        metadata.create_all(connection)
+        connection.execute(
+            values_t.insert(),
+            [
+                {"value": "a", "unicode_value": "測試"},
+                {"value": "b", "unicode_value": "téble2"},
+                {"value": None, "unicode_value": None},  # ignored
+                {"value": "c", "unicode_value": "🐍 su"},
+            ],
+        )
+
+        if unicode_separator:
+            separator = " 🐍試 "
+        else:
+            separator = " and "
+
+        if unicode_value:
+            col = values_t.c.unicode_value
+            expected = separator.join(["測試", "téble2", "🐍 su"])
+        else:
+            col = values_t.c.value
+            expected = separator.join(["a", "b", "c"])
+
+            # to join on a unicode separator, source string has to be unicode,
+            # so cast().  SQL Server will raise otherwise
+            if unicode_separator:
+                col = cast(col, Unicode(42))
+
+        value = connection.execute(
+            select(func.aggregate_strings(col, separator))
+        ).scalar_one()
+
+        eq_(value, expected)
+
     @testing.fails_on_everything_except("postgresql")
     def test_as_from(self, connection):
         # TODO: shouldn't this work on oracle too ?
@@ -1224,7 +1343,6 @@ class RegisterTest(fixtures.TestBase, AssertsCompiledSQL):
         assert "GenericFunction" not in functions._registry["_default"]
 
     def test_register_function(self):
-
         # test generic function registering
         class registered_func(GenericFunction):
             _register = True
@@ -1389,7 +1507,6 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_scalar_subquery(self):
-
         a = table(
             "a",
             column("id"),
@@ -1509,8 +1626,7 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
 
     def test_alias_column(self):
         """
-
-        ::
+        .. sourcecode:: sql
 
             SELECT x, y
             FROM
@@ -1541,8 +1657,7 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
 
     def test_column_valued_two(self):
         """
-
-        ::
+        .. sourcecode:: sql
 
             SELECT x, y
             FROM
@@ -1657,7 +1772,7 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
 
     def test_function_alias(self):
         """
-        ::
+        .. sourcecode:: sql
 
             SELECT result_elem -> 'Field' as field
             FROM "check" AS check_, json_array_elements(
@@ -1701,7 +1816,6 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_named_table_valued(self):
-
         fn = (
             func.json_to_recordset(  # noqa
                 '[{"a":1,"b":"foo"},{"a":"2","c":"bar"}]'
@@ -1720,7 +1834,6 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_named_table_valued_w_quoting(self):
-
         fn = (
             func.json_to_recordset(  # noqa
                 '[{"CaseSensitive":1,"the % value":"foo"}, '
@@ -1742,7 +1855,6 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_named_table_valued_subquery(self):
-
         fn = (
             func.json_to_recordset(  # noqa
                 '[{"a":1,"b":"foo"},{"a":"2","c":"bar"}]'
@@ -1765,7 +1877,6 @@ class TableValuedCompileTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_named_table_valued_alias(self):
-
         """select * from json_to_recordset
         ('[{"a":1,"b":"foo"},{"a":"2","c":"bar"}]') as x(a int, b text);"""
 

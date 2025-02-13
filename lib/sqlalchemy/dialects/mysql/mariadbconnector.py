@@ -1,5 +1,5 @@
-# mysql/mariadbconnector.py
-# Copyright (C) 2005-2023 the SQLAlchemy authors and contributors
+# dialects/mysql/mariadbconnector.py
+# Copyright (C) 2005-2025 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
 # This module is part of SQLAlchemy and is released under
@@ -30,14 +30,45 @@ be ``mysqldb``. ``mariadb+mariadbconnector://`` is required to use this driver.
 
 """  # noqa
 import re
+from uuid import UUID as _python_UUID
 
 from .base import MySQLCompiler
 from .base import MySQLDialect
 from .base import MySQLExecutionContext
+from .mariadb import MariaDBDialect
 from ... import sql
 from ... import util
+from ...sql import sqltypes
+
 
 mariadb_cpy_minimum_version = (1, 0, 1)
+
+
+class _MariaDBUUID(sqltypes.UUID[sqltypes._UUID_RETURN]):
+    # work around JIRA issue
+    # https://jira.mariadb.org/browse/CONPY-270.  When that issue is fixed,
+    # this type can be removed.
+    def result_processor(self, dialect, coltype):
+        if self.as_uuid:
+
+            def process(value):
+                if value is not None:
+                    if hasattr(value, "decode"):
+                        value = value.decode("ascii")
+                    value = _python_UUID(value)
+                return value
+
+            return process
+        else:
+
+            def process(value):
+                if value is not None:
+                    if hasattr(value, "decode"):
+                        value = value.decode("ascii")
+                    value = str(_python_UUID(value))
+                return value
+
+            return process
 
 
 class MySQLExecutionContext_mariadbconnector(MySQLExecutionContext):
@@ -50,6 +81,10 @@ class MySQLExecutionContext_mariadbconnector(MySQLExecutionContext):
         return self._dbapi_connection.cursor(buffered=True)
 
     def post_exec(self):
+        super().post_exec()
+
+        self._rowcount = self.cursor.rowcount
+
         if self.isinsert and self.compiled.postfetch_lastrowid:
             self._lastrowid = self.cursor.lastrowid
 
@@ -86,6 +121,10 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
     statement_compiler = MySQLCompiler_mariadbconnector
 
     supports_server_side_cursors = True
+
+    colspecs = util.update_copy(
+        MySQLDialect.colspecs, {sqltypes.Uuid: _MariaDBUUID}
+    )
 
     @util.memoized_property
     def _dbapi_version(self):
@@ -127,6 +166,7 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
 
     def create_connect_args(self, url):
         opts = url.translate_connect_args()
+        opts.update(url.query)
 
         int_params = [
             "connect_timeout",
@@ -141,6 +181,7 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
             "ssl_verify_cert",
             "ssl",
             "pool_reset_connection",
+            "compress",
         ]
 
         for key in int_params:
@@ -234,4 +275,12 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
         )
 
 
+class MariaDBDialect_mariadbconnector(
+    MariaDBDialect, MySQLDialect_mariadbconnector
+):
+    supports_statement_cache = True
+    _allows_uuid_binds = False
+
+
 dialect = MySQLDialect_mariadbconnector
+mariadb_dialect = MariaDBDialect_mariadbconnector

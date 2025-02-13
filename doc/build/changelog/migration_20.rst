@@ -250,7 +250,7 @@ With warnings turned on, our program now has a lot to say:
 
 .. sourcecode:: text
 
-  $ SQLALCHEMY_WARN_20=1 python2 -W always::DeprecationWarning test3.py
+  $ SQLALCHEMY_WARN_20=1 python -W always::DeprecationWarning test3.py
   test3.py:9: RemovedIn20Warning: The Engine.execute() function/method is considered legacy as of the 1.x series of SQLAlchemy and will be removed in 2.0. All statement execution in SQLAlchemy 2.0 is performed by the Connection.execute() method of Connection, or in the ORM by the Session.execute() method of Session. (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
     engine.execute("CREATE TABLE foo (id integer)")
   /home/classic/dev/sqlalchemy/lib/sqlalchemy/engine/base.py:2856: RemovedIn20Warning: Passing a string to Connection.execute() is deprecated and will be removed in version 2.0.  Use the text() construct, or the Connection.exec_driver_sql() method to invoke a driver-level SQL string. (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
@@ -296,7 +296,7 @@ as a bonus our program is much clearer::
         # select() now accepts column / table expressions positionally
         result = connection.execute(select(foo.c.id))
 
-    print(result.fetchall())
+        print(result.fetchall())
 
 The goal of "2.0 deprecations mode" is that a program which runs with no
 :class:`_exc.RemovedIn20Warning` warnings with "2.0 deprecations mode" turned
@@ -511,6 +511,7 @@ that descend from ``Base``::
 
 
     Base = declarative_base(cls=Base)
+
 
     # existing mapping proceeds, Declarative will ignore any annotations
     # which don't include ``Mapped[]``
@@ -770,7 +771,7 @@ the ORM-level :meth:`_orm.Session.execute` method)::
         t = Table("t", metadata_obj, autoload_with=connection)
 
         # execute SQL statements
-        result = conn.execute(t.select())
+        result = connection.execute(t.select())
 
 **Discussion**
 
@@ -1518,16 +1519,16 @@ following the table, and may include additional notes not summarized here.
 
       - ::
 
-          session.scalars(
+          session.scalar(
             select(func.count()).
             select_from(User)
-          ).one()
+          )
 
           # or
-          
-          session.scalars(
+
+          session.scalar(
             select(func.count(User.id))
-          ).one()
+          )
 
       - :meth:`_orm.Session.scalar`
 
@@ -1609,7 +1610,7 @@ necessary when using joined eager loading, the :meth:`_engine.Result.unique`
 modifier must be called first.
 
 Documentation for all new features of :func:`_sql.select` including execution
-options, etc. are at :doc:`/orm/queryguide`.
+options, etc. are at :doc:`/orm/queryguide/index`.
 
 Below are some examples of how to migrate to :func:`_sql.select`::
 
@@ -1686,7 +1687,7 @@ ORM-specific compiler plugins receive the
 :class:`_sql.Select` construct and interpret its contents in terms of an
 ORM-style query, before passing off to the core-level compiler in order to
 create a SQL string.  With the advent of the new
-`SQL compilation caching system <change_4639>`,
+:ref:`SQL compilation caching system <change_4639>`,
 the majority of this ORM logic is also cached.
 
 
@@ -2006,7 +2007,7 @@ The new approach makes use of the :func:`_orm.aliased` construct so that the
 ORM internals don't need to guess which entities and columns should be adapted
 and in what way; in the example above, the ``ua`` and ``aa`` objects, both
 of which are :class:`_orm.AliasedClass` instances, provide to the internals
-an unambiguous marker as to where the subquery should be referred towards
+an unambiguous marker as to where the subquery should be referenced
 as well as what entity column or relationship is being considered for a given
 component of the query.
 

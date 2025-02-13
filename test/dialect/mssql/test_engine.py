@@ -216,6 +216,55 @@ class ParseConnectTest(fixtures.TestBase):
             connection,
         )
 
+    @testing.combinations(
+        (
+            "quoted_plus",
+            (
+                "mssql+pyodbc:///?odbc_connect=DSN%3Dmydsn%3B"
+                "UID%3Ded%3BPWD%3Dpass%2Bword"
+            ),
+            "DSN=mydsn;UID=ed;PWD=pass+word",
+            ("DSN=mydsn;UID=ed;PWD=pass+word",),
+            "",
+        ),
+        (
+            "plus_for_space",
+            (
+                "mssql+pyodbc:///?odbc_connect=DSN%3Dmydsn%3B"
+                "UID%3Ded%3BPWD%3Dpass+word"
+            ),
+            "DSN=mydsn;UID=ed;PWD=pass word",
+            ("DSN=mydsn;UID=ed;PWD=pass word",),
+            "",
+        ),
+        (
+            "issue_11250_breaking_change",
+            (
+                "mssql+pyodbc:///?odbc_connect=DSN%3Dmydsn%3B"
+                "UID%3Ded%3BPWD%3Dpass%252Bword"
+            ),
+            "DSN=mydsn;UID=ed;PWD=pass%2Bword",
+            ("DSN=mydsn;UID=ed;PWD=pass%2Bword",),
+            "pre-11250 would unquote_plus() to PWD=pass+word",
+        ),
+        argnames="quoted_url, value_in_url_object, connection_string",
+        id_="iaaai",
+    )
+    def test_pyodbc_odbc_connect_with_pwd_plus(
+        self, quoted_url, value_in_url_object, connection_string
+    ):
+        dialect = pyodbc.dialect()
+        u = url.make_url(quoted_url)
+        eq_(value_in_url_object, u.query["odbc_connect"])
+        connection = dialect.create_connect_args(u)
+        eq_(
+            (
+                (connection_string),
+                {},
+            ),
+            connection,
+        )
+
     def test_pyodbc_odbc_connect_ignores_other_values(self):
         dialect = pyodbc.dialect()
         u = url.make_url(
@@ -247,7 +296,7 @@ class ParseConnectTest(fixtures.TestBase):
             ),
             (
                 "DRIVER={foob};Server=somehost%3BPORT%3D50001;"
-                "Database=somedb%3BPORT%3D50001;UID={someuser;PORT=50001};"
+                "Database={somedb;PORT=50001};UID={someuser;PORT=50001};"
                 "PWD={some{strange}}pw;PORT=50001}",
             ),
         ),
@@ -326,6 +375,7 @@ class ParseConnectTest(fixtures.TestBase):
             "message 20006",  # Write to the server failed
             "message 20017",  # Unexpected EOF from the server
             "message 20047",  # DBPROCESS is dead or not enabled
+            "The server failed to resume the transaction",
         ]:
             eq_(dialect.is_disconnect(error, None, None), True)
 
@@ -423,7 +473,7 @@ class FastExecutemanyTest(fixtures.TestBase):
     @testing.variation("add_event", [True, False])
     @testing.variation("setinputsizes", [True, False])
     @testing.variation("fastexecutemany", [True, False])
-    @testing.variation("insertmanyvalues", [True, False])
+    @testing.variation("insertmanyvalues", [False])  # disabled due to #9603
     @testing.variation("broken_types", [True, False])
     def test_insert_typing(
         self,
@@ -459,7 +509,10 @@ class FastExecutemanyTest(fixtures.TestBase):
         # (... four months pass ...)
         # surprise! we need it again.  woop!  for #8917
         expect_failure = (
-            broken_types and not setinputsizes and insertmanyvalues
+            broken_types
+            and not setinputsizes
+            and insertmanyvalues
+            and not fastexecutemany
         )
 
         engine = testing_engine(
@@ -531,7 +584,6 @@ class FastExecutemanyTest(fixtures.TestBase):
                         )
 
         with engine.begin() as conn:
-
             if expect_failure:
                 with expect_raises(DBAPIError):
                     conn.execute(observations.insert(), records)

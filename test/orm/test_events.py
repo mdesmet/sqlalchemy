@@ -16,6 +16,7 @@ from sqlalchemy import literal_column
 from sqlalchemy import select
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy import update
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import class_mapper
@@ -65,7 +66,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         cls._setup_stock_mapping()
 
     def _caching_session_fixture(self):
-
         cache = {}
 
         maker = sessionmaker(testing.db, future=True)
@@ -101,7 +101,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         User, Address = self.classes("User", "Address")
 
         with self.sql_execution_asserter(testing.db) as asserter:
-
             with self._caching_session_fixture() as session:
                 stmt = (
                     select(User)
@@ -340,7 +339,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
             sess.execute(insert(User), orig_params)
 
     def test_chained_events_one(self):
-
         sess = Session(testing.db, future=True)
 
         @event.listens_for(sess, "do_orm_execute")
@@ -376,7 +374,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
 
         @event.listens_for(session, "do_orm_execute")
         def do_orm_execute(ctx):
-
             if not ctx.is_select:
                 assert_raises_message(
                     sa.exc.InvalidRequestError,
@@ -388,17 +385,55 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                 bind_mapper=ctx.bind_mapper,
                 all_mappers=ctx.all_mappers,
                 is_select=ctx.is_select,
+                is_from_statement=ctx.is_from_statement,
+                is_insert=ctx.is_insert,
                 is_update=ctx.is_update,
                 is_delete=ctx.is_delete,
                 is_orm_statement=ctx.is_orm_statement,
                 is_relationship_load=ctx.is_relationship_load,
                 is_column_load=ctx.is_column_load,
-                lazy_loaded_from=ctx.lazy_loaded_from
-                if ctx.is_select
-                else None,
+                lazy_loaded_from=(
+                    ctx.lazy_loaded_from if ctx.is_select else None
+                ),
             )
 
         return canary
+
+    @testing.combinations(
+        (lambda: select(1), True),
+        (
+            lambda user_table: select(user_table).union(select(user_table)),
+            True,
+        ),
+        (lambda: text("select * from users"), False),
+    )
+    def test_non_orm_statements(self, stmt, is_select):
+        sess = Session(testing.db, future=True)
+
+        canary = self._flag_fixture(sess)
+
+        user_table = self.tables.users
+        stmt = testing.resolve_lambda(stmt, user_table=user_table)
+        sess.execute(stmt).all()
+
+        eq_(
+            canary.mock_calls,
+            [
+                call.options(
+                    bind_mapper=None,
+                    all_mappers=[],
+                    is_select=is_select,
+                    is_from_statement=False,
+                    is_insert=False,
+                    is_update=False,
+                    is_delete=False,
+                    is_orm_statement=False,
+                    is_relationship_load=False,
+                    is_column_load=False,
+                    lazy_loaded_from=None,
+                )
+            ],
+        )
 
     def test_all_mappers_accessor_one(self):
         User, Address = self.classes("User", "Address")
@@ -420,6 +455,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User), inspect(Address)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -431,7 +468,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         )
 
     def test_all_mappers_accessor_two(self):
-
         sess = Session(testing.db, future=True)
 
         canary = self._flag_fixture(sess)
@@ -445,6 +481,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=None,
                     all_mappers=[],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=False,
@@ -471,6 +509,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],  # Address not in results
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -501,6 +541,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -512,6 +554,54 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
+                    is_update=False,
+                    is_delete=False,
+                    is_orm_statement=True,
+                    is_relationship_load=False,
+                    is_column_load=True,
+                    lazy_loaded_from=None,
+                ),
+            ],
+        )
+
+    def test_select_from_statement_flags(self):
+        User, Address = self.classes("User", "Address")
+
+        sess = Session(testing.db, future=True)
+
+        canary = self._flag_fixture(sess)
+
+        s1 = select(User).filter_by(id=7)
+        u1 = sess.execute(select(User).from_statement(s1)).scalar_one()
+
+        sess.expire(u1)
+
+        eq_(u1.name, "jack")
+
+        eq_(
+            canary.mock_calls,
+            [
+                call.options(
+                    bind_mapper=inspect(User),
+                    all_mappers=[inspect(User)],
+                    is_select=True,
+                    is_from_statement=True,
+                    is_insert=False,
+                    is_update=False,
+                    is_delete=False,
+                    is_orm_statement=True,
+                    is_relationship_load=False,
+                    is_column_load=False,
+                    lazy_loaded_from=None,
+                ),
+                call.options(
+                    bind_mapper=inspect(User),
+                    all_mappers=[inspect(User)],
+                    is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -540,6 +630,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -551,6 +643,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(Address),
                     all_mappers=[inspect(Address)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -581,6 +675,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -592,6 +688,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(Address),
                     all_mappers=[inspect(Address)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -622,6 +720,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -633,6 +733,8 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(Address),
                     all_mappers=[inspect(Address), inspect(User)],
                     is_select=True,
+                    is_from_statement=False,
+                    is_insert=False,
                     is_update=False,
                     is_delete=False,
                     is_orm_statement=True,
@@ -643,24 +745,45 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
             ],
         )
 
-    def test_update_delete_flags(self):
+    @testing.variation(
+        "stmt_type",
+        [
+            ("insert", testing.requires.insert_returning),
+            ("update", testing.requires.update_returning),
+            ("delete", testing.requires.delete_returning),
+        ],
+    )
+    @testing.variation("from_stmt", [True, False])
+    def test_update_delete_flags(self, stmt_type, from_stmt):
         User, Address = self.classes("User", "Address")
 
         sess = Session(testing.db, future=True)
 
         canary = self._flag_fixture(sess)
 
-        sess.execute(
-            delete(User)
-            .filter_by(id=18)
-            .execution_options(synchronize_session="evaluate")
-        )
-        sess.execute(
-            update(User)
-            .filter_by(id=18)
-            .values(name="eighteen")
-            .execution_options(synchronize_session="evaluate")
-        )
+        if stmt_type.delete:
+            stmt = (
+                delete(User)
+                .filter_by(id=18)
+                .execution_options(synchronize_session="evaluate")
+            )
+        elif stmt_type.update:
+            stmt = (
+                update(User)
+                .filter_by(id=18)
+                .values(name="eighteen")
+                .execution_options(synchronize_session="evaluate")
+            )
+        elif stmt_type.insert:
+            stmt = insert(User).values(name="eighteen")
+        else:
+            stmt_type.fail()
+
+        if from_stmt:
+            stmt = select(User).from_statement(stmt.returning(User))
+
+        result = sess.execute(stmt)
+        result.close()
 
         eq_(
             canary.mock_calls,
@@ -669,19 +792,10 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
                     bind_mapper=inspect(User),
                     all_mappers=[inspect(User)],
                     is_select=False,
-                    is_update=False,
-                    is_delete=True,
-                    is_orm_statement=True,
-                    is_relationship_load=False,
-                    is_column_load=False,
-                    lazy_loaded_from=None,
-                ),
-                call.options(
-                    bind_mapper=inspect(User),
-                    all_mappers=[inspect(User)],
-                    is_select=False,
-                    is_update=True,
-                    is_delete=False,
+                    is_from_statement=bool(from_stmt),
+                    is_insert=stmt_type.insert,
+                    is_update=stmt_type.update,
+                    is_delete=stmt_type.delete,
                     is_orm_statement=True,
                     is_relationship_load=False,
                     is_column_load=False,
@@ -691,7 +805,6 @@ class ORMExecuteTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         )
 
     def test_chained_events_two(self):
-
         sess = Session(testing.db, future=True)
 
         def added(ctx):
@@ -1318,7 +1431,6 @@ class MapperEventsTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         ["listen_on_mapper", "listen_on_base", "listen_on_mixin"],
     )
     def test_mapper_config_sequence(self, decl_base, listen_type):
-
         canary = Mock()
 
         if listen_type.listen_on_mapper:
@@ -1517,9 +1629,11 @@ class RestoreLoadContextTest(fixtures.DeclarativeMappedTest):
             (
                 lambda session: session,
                 "loaded_as_persistent",
-                lambda session, instance: instance.unloaded
-                if instance.__class__.__name__ == "A"
-                else None,
+                lambda session, instance: (
+                    instance.unloaded
+                    if instance.__class__.__name__ == "A"
+                    else None
+                ),
             ),
             argnames="target, event_name, fn",
         )(fn)
@@ -1641,8 +1755,7 @@ class DeclarativeEventListenTest(
 
 
 class DeferredMapperEventsTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
-
-    """ "test event listeners against unmapped classes.
+    """test event listeners against unmapped classes.
 
     This incurs special logic.  Note if we ever do the "remove" case,
     it has to get all of these, too.
@@ -2468,8 +2581,9 @@ class SessionEventsTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
         u2 = User(name="u1", id=1)
         sess.add(u2)
 
-        with expect_raises(sa.exc.IntegrityError), expect_warnings(
-            "New instance"
+        with (
+            expect_raises(sa.exc.IntegrityError),
+            expect_warnings("New instance"),
         ):
             sess.commit()
 
@@ -2524,8 +2638,9 @@ class SessionEventsTest(RemoveORMEventsGlobally, _fixtures.FixtureTest):
 
         u2 = User(name="u1", id=1)
         sess.add(u2)
-        with expect_raises(sa.exc.IntegrityError), expect_warnings(
-            "New instance"
+        with (
+            expect_raises(sa.exc.IntegrityError),
+            expect_warnings("New instance"),
         ):
             sess.commit()
 

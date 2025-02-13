@@ -23,6 +23,7 @@ from sqlalchemy import Text
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import base as postgresql
+from sqlalchemy.dialects.postgresql import DOMAIN
 from sqlalchemy.dialects.postgresql import ExcludeConstraint
 from sqlalchemy.dialects.postgresql import INTEGER
 from sqlalchemy.dialects.postgresql import INTERVAL
@@ -34,6 +35,7 @@ from sqlalchemy.schema import CreateIndex
 from sqlalchemy.sql import ddl as sa_ddl
 from sqlalchemy.sql.schema import CheckConstraint
 from sqlalchemy.testing import AssertsCompiledSQL
+from sqlalchemy.testing import config
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import mock
 from sqlalchemy.testing.assertions import assert_warns
@@ -321,15 +323,20 @@ class MaterializedViewReflectionTest(
         insp = inspect(connection)
 
         def normalize(definition):
+            # pg16 returns "SELECT" without qualifying tablename.
+            # older pgs include it
+            definition = re.sub(
+                r"testtable\.(\w+)", lambda m: m.group(1), definition
+            )
             return re.sub(r"[\n\t ]+", " ", definition.strip())
 
         eq_(
             normalize(insp.get_view_definition("test_mview")),
-            "SELECT testtable.id, testtable.data FROM testtable;",
+            "SELECT id, data FROM testtable;",
         )
         eq_(
             normalize(insp.get_view_definition("test_regview")),
-            "SELECT testtable.data FROM testtable;",
+            "SELECT data FROM testtable;",
         )
 
     def test_get_view_comment(self, connection):
@@ -399,84 +406,164 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
     __only_on__ = "postgresql > 8.3"
     __backend__ = True
 
-    @classmethod
-    def setup_test_class(cls):
-        with testing.db.begin() as con:
-            for ddl in [
-                'CREATE SCHEMA "SomeSchema"',
-                "CREATE DOMAIN testdomain INTEGER NOT NULL DEFAULT 42",
-                "CREATE DOMAIN test_schema.testdomain INTEGER DEFAULT 0",
-                "CREATE TYPE testtype AS ENUM ('test')",
-                "CREATE DOMAIN enumdomain AS testtype",
-                "CREATE DOMAIN arraydomain AS INTEGER[]",
-                'CREATE DOMAIN "SomeSchema"."Quoted.Domain" INTEGER DEFAULT 0',
-                "CREATE DOMAIN nullable_domain AS TEXT CHECK "
-                "(VALUE IN('FOO', 'BAR'))",
-                "CREATE DOMAIN not_nullable_domain AS TEXT NOT NULL",
-                "CREATE DOMAIN my_int AS int CONSTRAINT b_my_int_one CHECK "
-                "(VALUE > 1) CONSTRAINT a_my_int_two CHECK (VALUE < 42) "
-                "CHECK(VALUE != 22)",
-            ]:
-                try:
-                    con.exec_driver_sql(ddl)
-                except exc.DBAPIError as e:
-                    if "already exists" not in str(e):
-                        raise e
-            con.exec_driver_sql(
-                "CREATE TABLE testtable (question integer, answer "
-                "testdomain)"
-            )
-            con.exec_driver_sql(
-                "CREATE TABLE test_schema.testtable(question "
-                "integer, answer test_schema.testdomain, anything "
-                "integer)"
-            )
-            con.exec_driver_sql(
-                "CREATE TABLE crosschema (question integer, answer "
-                "test_schema.testdomain)"
+    # these fixtures are all currently using individual test scope,
+    # on a connection that's in a transaction that's rolled back.
+    # previously, this test would build up all the domains / tables
+    # at the class level and commit them.  PostgreSQL seems to be extremely
+    # fast at building up / tearing down domains / schemas etc within an
+    # uncommitted transaction so it seems OK to keep these at per-test
+    # scope.
+
+    @testing.fixture()
+    def broken_nullable_domains(self):
+        if not testing.requires.postgresql_working_nullable_domains.enabled:
+            config.skip_test(
+                "reflection of nullable domains broken on PG 17.0-17.2"
             )
 
-            con.exec_driver_sql(
-                "CREATE TABLE enum_test (id integer, data enumdomain)"
-            )
+    @testing.fixture()
+    def testdomain(self, connection, broken_nullable_domains):
+        connection.exec_driver_sql(
+            "CREATE DOMAIN testdomain INTEGER NOT NULL DEFAULT 42"
+        )
+        yield
+        connection.exec_driver_sql("DROP DOMAIN testdomain")
 
-            con.exec_driver_sql(
-                "CREATE TABLE array_test (id integer, data arraydomain)"
-            )
+    @testing.fixture
+    def testtable(self, connection, testdomain):
+        connection.exec_driver_sql(
+            "CREATE TABLE testtable (question integer, answer " "testdomain)"
+        )
+        yield
+        connection.exec_driver_sql("DROP TABLE testtable")
 
-            con.exec_driver_sql(
-                "CREATE TABLE quote_test "
-                '(id integer, data "SomeSchema"."Quoted.Domain")'
-            )
-            con.exec_driver_sql(
-                "CREATE TABLE nullable_domain_test "
-                "(not_nullable_domain_col nullable_domain not null,"
-                "nullable_local not_nullable_domain)"
-            )
+    @testing.fixture
+    def nullable_domains(self, connection, broken_nullable_domains):
+        connection.exec_driver_sql(
+            'CREATE DOMAIN nullable_domain AS TEXT COLLATE "C" CHECK '
+            "(VALUE IN('FOO', 'BAR'))"
+        )
+        connection.exec_driver_sql(
+            "CREATE DOMAIN not_nullable_domain AS TEXT NOT NULL"
+        )
+        yield
+        connection.exec_driver_sql("DROP DOMAIN nullable_domain")
+        connection.exec_driver_sql("DROP DOMAIN not_nullable_domain")
 
-    @classmethod
-    def teardown_test_class(cls):
-        with testing.db.begin() as con:
-            con.exec_driver_sql("DROP TABLE testtable")
-            con.exec_driver_sql("DROP TABLE test_schema.testtable")
-            con.exec_driver_sql("DROP TABLE crosschema")
-            con.exec_driver_sql("DROP TABLE quote_test")
-            con.exec_driver_sql("DROP DOMAIN testdomain")
-            con.exec_driver_sql("DROP DOMAIN test_schema.testdomain")
-            con.exec_driver_sql("DROP TABLE enum_test")
-            con.exec_driver_sql("DROP DOMAIN enumdomain")
-            con.exec_driver_sql("DROP TYPE testtype")
-            con.exec_driver_sql("DROP TABLE array_test")
-            con.exec_driver_sql("DROP DOMAIN arraydomain")
-            con.exec_driver_sql('DROP DOMAIN "SomeSchema"."Quoted.Domain"')
-            con.exec_driver_sql('DROP SCHEMA "SomeSchema"')
+    @testing.fixture
+    def nullable_domain_table(self, connection, nullable_domains):
+        connection.exec_driver_sql(
+            "CREATE TABLE nullable_domain_test "
+            "(not_nullable_domain_col nullable_domain not null,"
+            "nullable_local not_nullable_domain)"
+        )
+        yield
+        connection.exec_driver_sql("DROP TABLE nullable_domain_test")
 
-            con.exec_driver_sql("DROP TABLE nullable_domain_test")
-            con.exec_driver_sql("DROP DOMAIN nullable_domain")
-            con.exec_driver_sql("DROP DOMAIN not_nullable_domain")
-            con.exec_driver_sql("DROP DOMAIN my_int")
+    @testing.fixture
+    def enum_domain(self, connection):
+        connection.exec_driver_sql("CREATE TYPE testtype AS ENUM ('test')")
+        connection.exec_driver_sql("CREATE DOMAIN enumdomain AS testtype")
+        yield
+        connection.exec_driver_sql("drop domain enumdomain")
+        connection.exec_driver_sql("drop type testtype")
 
-    def test_table_is_reflected(self, connection):
+    @testing.fixture
+    def enum_table(self, connection, enum_domain):
+        connection.exec_driver_sql(
+            "CREATE TABLE enum_test (id integer, data enumdomain)"
+        )
+        yield
+        connection.exec_driver_sql("DROP TABLE enum_test")
+
+    @testing.fixture
+    def array_domains(self, connection):
+        connection.exec_driver_sql("CREATE DOMAIN arraydomain AS INTEGER[]")
+        connection.exec_driver_sql(
+            "CREATE DOMAIN arraydomain_2d AS INTEGER[][]"
+        )
+        connection.exec_driver_sql(
+            "CREATE DOMAIN arraydomain_3d AS  INTEGER[][][]"
+        )
+        yield
+        connection.exec_driver_sql("DROP DOMAIN arraydomain")
+        connection.exec_driver_sql("DROP DOMAIN arraydomain_2d")
+        connection.exec_driver_sql("DROP DOMAIN arraydomain_3d")
+
+    @testing.fixture
+    def array_table(self, connection, array_domains):
+        connection.exec_driver_sql(
+            "CREATE TABLE array_test ("
+            "id integer, "
+            "datas arraydomain, "
+            "datass arraydomain_2d, "
+            "datasss arraydomain_3d"
+            ")"
+        )
+        yield
+        connection.exec_driver_sql("DROP TABLE array_test")
+
+    @testing.fixture
+    def some_schema(self, connection):
+        connection.exec_driver_sql('CREATE SCHEMA IF NOT EXISTS "SomeSchema"')
+        yield
+        connection.exec_driver_sql('DROP SCHEMA IF EXISTS "SomeSchema"')
+
+    @testing.fixture
+    def quoted_schema_domain(self, connection, some_schema):
+        connection.exec_driver_sql(
+            'CREATE DOMAIN "SomeSchema"."Quoted.Domain" INTEGER DEFAULT 0'
+        )
+        yield
+        connection.exec_driver_sql('DROP DOMAIN "SomeSchema"."Quoted.Domain"')
+
+    @testing.fixture
+    def int_domain(self, connection):
+        connection.exec_driver_sql(
+            "CREATE DOMAIN my_int AS int CONSTRAINT b_my_int_one CHECK "
+            "(VALUE > 1) CONSTRAINT a_my_int_two CHECK (VALUE < 42) "
+            "CHECK(VALUE != 22)"
+        )
+        yield
+        connection.exec_driver_sql("DROP DOMAIN my_int")
+
+    @testing.fixture
+    def quote_table(self, connection, quoted_schema_domain):
+        connection.exec_driver_sql(
+            "CREATE TABLE quote_test "
+            '(id integer, data "SomeSchema"."Quoted.Domain")'
+        )
+        yield
+        connection.exec_driver_sql("drop table quote_test")
+
+    @testing.fixture
+    def testdomain_schema(self, connection):
+        connection.exec_driver_sql(
+            "CREATE DOMAIN test_schema.testdomain INTEGER DEFAULT 0"
+        )
+        yield
+        connection.exec_driver_sql("DROP DOMAIN test_schema.testdomain")
+
+    @testing.fixture
+    def testtable_schema(self, connection, testdomain_schema):
+        connection.exec_driver_sql(
+            "CREATE TABLE test_schema.testtable(question "
+            "integer, answer test_schema.testdomain, anything "
+            "integer)"
+        )
+        yield
+        connection.exec_driver_sql("drop table test_schema.testtable")
+
+    @testing.fixture
+    def crosschema_table(self, connection, testdomain_schema):
+        connection.exec_driver_sql(
+            "CREATE TABLE crosschema (question integer, answer "
+            f"{config.test_schema}.testdomain)"
+        )
+        yield
+        connection.exec_driver_sql("DROP TABLE crosschema")
+
+    def test_table_is_reflected(self, connection, testtable):
         metadata = MetaData()
         table = Table("testtable", metadata, autoload_with=connection)
         eq_(
@@ -484,9 +571,11 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
             {"question", "answer"},
             "Columns of reflected table didn't equal expected columns",
         )
-        assert isinstance(table.c.answer.type, Integer)
+        assert isinstance(table.c.answer.type, DOMAIN)
+        assert table.c.answer.type.name, "testdomain"
+        assert isinstance(table.c.answer.type.data_type, Integer)
 
-    def test_nullable_from_domain(self, connection):
+    def test_nullable_from_domain(self, connection, nullable_domain_table):
         metadata = MetaData()
         table = Table(
             "nullable_domain_test", metadata, autoload_with=connection
@@ -494,7 +583,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         is_(table.c.not_nullable_domain_col.nullable, False)
         is_(table.c.nullable_local.nullable, False)
 
-    def test_domain_is_reflected(self, connection):
+    def test_domain_is_reflected(self, connection, testtable):
         metadata = MetaData()
         table = Table("testtable", metadata, autoload_with=connection)
         eq_(
@@ -506,29 +595,51 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
             not table.columns.answer.nullable
         ), "Expected reflected column to not be nullable."
 
-    def test_enum_domain_is_reflected(self, connection):
+    def test_enum_domain_is_reflected(self, connection, enum_table):
         metadata = MetaData()
         table = Table("enum_test", metadata, autoload_with=connection)
-        eq_(table.c.data.type.enums, ["test"])
+        assert isinstance(table.c.data.type, DOMAIN)
+        eq_(table.c.data.type.data_type.enums, ["test"])
 
-    def test_array_domain_is_reflected(self, connection):
+    def test_array_domain_is_reflected(self, connection, array_table):
         metadata = MetaData()
         table = Table("array_test", metadata, autoload_with=connection)
-        eq_(table.c.data.type.__class__, ARRAY)
-        eq_(table.c.data.type.item_type.__class__, INTEGER)
 
-    def test_quoted_remote_schema_domain_is_reflected(self, connection):
+        def assert_is_integer_array_domain(domain, name):
+            # Postgres does not persist the dimensionality of the array.
+            # It's always treated as integer[]
+            assert isinstance(domain, DOMAIN)
+            assert domain.name == name
+            assert isinstance(domain.data_type, ARRAY)
+            assert isinstance(domain.data_type.item_type, INTEGER)
+
+        array_domain = table.c.datas.type
+        assert_is_integer_array_domain(array_domain, "arraydomain")
+
+        array_domain_2d = table.c.datass.type
+        assert_is_integer_array_domain(array_domain_2d, "arraydomain_2d")
+
+        array_domain_3d = table.c.datasss.type
+        assert_is_integer_array_domain(array_domain_3d, "arraydomain_3d")
+
+    def test_quoted_remote_schema_domain_is_reflected(
+        self, connection, quote_table
+    ):
         metadata = MetaData()
         table = Table("quote_test", metadata, autoload_with=connection)
-        eq_(table.c.data.type.__class__, INTEGER)
+        assert isinstance(table.c.data.type, DOMAIN)
+        assert table.c.data.type.name, "Quoted.Domain"
+        assert isinstance(table.c.data.type.data_type, Integer)
 
-    def test_table_is_reflected_test_schema(self, connection):
+    def test_table_is_reflected_test_schema(
+        self, connection, testtable_schema
+    ):
         metadata = MetaData()
         table = Table(
             "testtable",
             metadata,
             autoload_with=connection,
-            schema="test_schema",
+            schema=config.test_schema,
         )
         eq_(
             set(table.columns.keys()),
@@ -537,13 +648,13 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         )
         assert isinstance(table.c.anything.type, Integer)
 
-    def test_schema_domain_is_reflected(self, connection):
+    def test_schema_domain_is_reflected(self, connection, testtable_schema):
         metadata = MetaData()
         table = Table(
             "testtable",
             metadata,
             autoload_with=connection,
-            schema="test_schema",
+            schema=config.test_schema,
         )
         eq_(
             str(table.columns.answer.server_default.arg),
@@ -554,7 +665,9 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
             table.columns.answer.nullable
         ), "Expected reflected column to be nullable."
 
-    def test_crosschema_domain_is_reflected(self, connection):
+    def test_crosschema_domain_is_reflected(
+        self, connection, crosschema_table
+    ):
         metadata = MetaData()
         table = Table("crosschema", metadata, autoload_with=connection)
         eq_(
@@ -566,7 +679,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
             table.columns.answer.nullable
         ), "Expected reflected column to be nullable."
 
-    def test_unknown_types(self, connection):
+    def test_unknown_types(self, connection, testtable):
         from sqlalchemy.dialects.postgresql import base
 
         ischema_names = base.PGDialect.ischema_names
@@ -586,8 +699,17 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
         finally:
             base.PGDialect.ischema_names = ischema_names
 
-    @property
-    def all_domains(self):
+    @testing.fixture
+    def all_domains(
+        self,
+        quoted_schema_domain,
+        array_domains,
+        enum_domain,
+        nullable_domains,
+        int_domain,
+        testdomain,
+        testdomain_schema,
+    ):
         return {
             "public": [
                 {
@@ -598,6 +720,27 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "integer[]",
                     "default": None,
                     "constraints": [],
+                    "collation": None,
+                },
+                {
+                    "visible": True,
+                    "name": "arraydomain_2d",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "integer[]",
+                    "default": None,
+                    "constraints": [],
+                    "collation": None,
+                },
+                {
+                    "visible": True,
+                    "name": "arraydomain_3d",
+                    "schema": "public",
+                    "nullable": True,
+                    "type": "integer[]",
+                    "default": None,
+                    "constraints": [],
+                    "collation": None,
                 },
                 {
                     "visible": True,
@@ -607,6 +750,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "testtype",
                     "default": None,
                     "constraints": [],
+                    "collation": None,
                 },
                 {
                     "visible": True,
@@ -621,6 +765,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                         # autogenerated name by pg
                         {"check": "VALUE <> 22", "name": "my_int_check"},
                     ],
+                    "collation": None,
                 },
                 {
                     "visible": True,
@@ -630,6 +775,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "text",
                     "default": None,
                     "constraints": [],
+                    "collation": "default",
                 },
                 {
                     "visible": True,
@@ -646,6 +792,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                             "name": "nullable_domain_check",
                         }
                     ],
+                    "collation": "C",
                 },
                 {
                     "visible": True,
@@ -655,6 +802,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "integer",
                     "default": "42",
                     "constraints": [],
+                    "collation": None,
                 },
             ],
             "test_schema": [
@@ -666,6 +814,7 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "integer",
                     "default": "0",
                     "constraints": [],
+                    "collation": None,
                 }
             ],
             "SomeSchema": [
@@ -677,30 +826,66 @@ class DomainReflectionTest(fixtures.TestBase, AssertsExecutionResults):
                     "type": "integer",
                     "default": "0",
                     "constraints": [],
+                    "collation": None,
                 }
             ],
         }
 
-    def test_inspect_domains(self, connection):
+    def test_inspect_domains(self, connection, all_domains):
         inspector = inspect(connection)
-        eq_(inspector.get_domains(), self.all_domains["public"])
+        domains = inspector.get_domains()
 
-    def test_inspect_domains_schema(self, connection):
+        domain_names = {d["name"] for d in domains}
+        expect_domain_names = {d["name"] for d in all_domains["public"]}
+        eq_(domain_names, expect_domain_names)
+
+        eq_(domains, all_domains["public"])
+
+    def test_inspect_domains_schema(self, connection, all_domains):
         inspector = inspect(connection)
         eq_(
             inspector.get_domains("test_schema"),
-            self.all_domains["test_schema"],
+            all_domains["test_schema"],
         )
-        eq_(
-            inspector.get_domains("SomeSchema"), self.all_domains["SomeSchema"]
-        )
+        eq_(inspector.get_domains("SomeSchema"), all_domains["SomeSchema"])
 
-    def test_inspect_domains_star(self, connection):
+    def test_inspect_domains_star(self, connection, all_domains):
         inspector = inspect(connection)
-        all_ = [d for dl in self.all_domains.values() for d in dl]
+        all_ = [d for dl in all_domains.values() for d in dl]
         all_ += inspector.get_domains("information_schema")
         exp = sorted(all_, key=lambda d: (d["schema"], d["name"]))
-        eq_(inspector.get_domains("*"), exp)
+        domains = inspector.get_domains("*")
+
+        eq_(domains, exp)
+
+
+class ArrayReflectionTest(fixtures.TablesTest):
+    __only_on__ = "postgresql >= 10"
+    __backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "array_table",
+            metadata,
+            Column("id", INTEGER, primary_key=True),
+            Column("datas", ARRAY(INTEGER)),
+            Column("datass", ARRAY(INTEGER, dimensions=2)),
+            Column("datasss", ARRAY(INTEGER, dimensions=3)),
+        )
+
+    def test_array_table_is_reflected(self, connection):
+        metadata = MetaData()
+        table = Table("array_table", metadata, autoload_with=connection)
+
+        def assert_is_integer_array(data_type):
+            assert isinstance(data_type, ARRAY)
+            # posgres treats all arrays as one-dimensional arrays
+            assert isinstance(data_type.item_type, INTEGER)
+
+        assert_is_integer_array(table.c.datas.type)
+        assert_is_integer_array(table.c.datass.type)
+        assert_is_integer_array(table.c.datasss.type)
 
 
 class ReflectionTest(
@@ -821,7 +1006,6 @@ class ReflectionTest(
         assert inspect(connection).has_table("some_temp_table")
 
     def test_cross_schema_reflection_one(self, metadata, connection):
-
         meta1 = metadata
 
         users = Table(
@@ -1127,7 +1311,6 @@ class ReflectionTest(
         )
 
     def test_uppercase_lowercase_table(self, metadata, connection):
-
         a_table = Table("a", metadata, Column("x", Integer))
         A_table = Table("A", metadata, Column("x", Integer))
 
@@ -1138,7 +1321,6 @@ class ReflectionTest(
         assert inspect(connection).has_table("A")
 
     def test_uppercase_lowercase_sequence(self, connection):
-
         a_seq = Sequence("a")
         A_seq = Sequence("A")
 
@@ -1166,7 +1348,7 @@ class ReflectionTest(
         connection.exec_driver_sql(
             """
             create index idx3 on party
-                (lower(name::text), other, lower(aname::text))
+                (lower(name::text), other, lower(aname::text) desc)
             """
         )
         connection.exec_driver_sql(
@@ -1182,6 +1364,15 @@ class ReflectionTest(
                 where name != 'foo'
             """
         )
+        version = connection.dialect.server_version_info
+        if version >= (15,):
+            connection.exec_driver_sql(
+                """
+                create unique index zz_idx5 on party
+                    (name desc, upper(other))
+                    nulls not distinct
+                """
+            )
 
         expected = [
             {
@@ -1216,6 +1407,7 @@ class ReflectionTest(
                 "unique": False,
                 "include_columns": [],
                 "dialect_options": {"postgresql_include": []},
+                "column_sorting": {"lower(aname::text)": ("desc",)},
             },
             {
                 "name": "idx4",
@@ -1240,7 +1432,23 @@ class ReflectionTest(
                 "dialect_options": {"postgresql_include": []},
             },
         ]
-        if connection.dialect.server_version_info < (11,):
+        if version > (15,):
+            expected.append(
+                {
+                    "name": "zz_idx5",
+                    "column_names": ["name", None],
+                    "expressions": ["name", "upper(other::text)"],
+                    "unique": True,
+                    "include_columns": [],
+                    "dialect_options": {
+                        "postgresql_include": [],
+                        "postgresql_nulls_not_distinct": True,
+                    },
+                    "column_sorting": {"name": ("desc",)},
+                },
+            )
+
+        if version < (11,):
             for index in expected:
                 index.pop("include_columns")
                 index["dialect_options"].pop("postgresql_include")
@@ -1464,6 +1672,72 @@ class ReflectionTest(
             "gin",
         )
 
+    @testing.skip_if("postgresql < 15.0", "nullsnotdistinct not supported")
+    def test_nullsnotdistinct(self, metadata, connection):
+        Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("x", ARRAY(Integer)),
+            Column("y", ARRAY(Integer)),
+            Index(
+                "idx1", "x", unique=True, postgresql_nulls_not_distinct=True
+            ),
+            UniqueConstraint(
+                "y", name="unq1", postgresql_nulls_not_distinct=True
+            ),
+        )
+        metadata.create_all(connection)
+
+        ind = inspect(connection).get_indexes("t", None)
+        expected_ind = [
+            {
+                "unique": True,
+                "column_names": ["x"],
+                "name": "idx1",
+                "dialect_options": {
+                    "postgresql_nulls_not_distinct": True,
+                    "postgresql_include": [],
+                },
+                "include_columns": [],
+            },
+            {
+                "unique": True,
+                "column_names": ["y"],
+                "name": "unq1",
+                "dialect_options": {
+                    "postgresql_nulls_not_distinct": True,
+                    "postgresql_include": [],
+                },
+                "include_columns": [],
+                "duplicates_constraint": "unq1",
+            },
+        ]
+        eq_(ind, expected_ind)
+
+        unq = inspect(connection).get_unique_constraints("t", None)
+        expected_unq = [
+            {
+                "column_names": ["y"],
+                "name": "unq1",
+                "dialect_options": {
+                    "postgresql_nulls_not_distinct": True,
+                },
+                "comment": None,
+            }
+        ]
+        eq_(unq, expected_unq)
+
+        m = MetaData()
+        t1 = Table("t", m, autoload_with=connection)
+        eq_(len(t1.indexes), 1)
+        idx_options = list(t1.indexes)[0].dialect_options["postgresql"]
+        eq_(idx_options["nulls_not_distinct"], True)
+
+        cst = {c.name: c for c in t1.constraints}
+        cst_options = cst["unq1"].dialect_options["postgresql"]
+        eq_(cst_options["nulls_not_distinct"], True)
+
     @testing.skip_if("postgresql < 11.0", "indnkeyatts not supported")
     def test_index_reflection_with_include(self, metadata, connection):
         """reflect indexes with include set"""
@@ -1633,7 +1907,6 @@ class ReflectionTest(
         is_false(inspector.has_type("mood"))
 
     def test_inspect_enums(self, metadata, inspect_fixture):
-
         inspector, conn = inspect_fixture
 
         enum_type = postgresql.ENUM(
@@ -1697,7 +1970,6 @@ class ReflectionTest(
 
         for enum in "lower_case", "UpperCase", "Name.With.Dot":
             for schema in None, "test_schema", "TestSchema":
-
                 postgresql.ENUM(
                     "CapsOne",
                     "CapsTwo",
@@ -1752,7 +2024,6 @@ class ReflectionTest(
         counter = itertools.count()
         for enum in "lower_case", "UpperCase", "Name.With.Dot":
             for schema in None, "test_schema", "TestSchema":
-
                 enum_type = postgresql.ENUM(
                     "CapsOne",
                     "CapsTwo",
@@ -2103,6 +2374,42 @@ class ReflectionTest(
                     "dialect_options": {"not_valid": True},
                     "comment": None,
                 }
+            ],
+        )
+
+    def test_reflect_with_no_inherit_check_constraint(self):
+        rows = [
+            ("foo", "some name", "CHECK ((a IS NOT NULL)) NO INHERIT", None),
+            (
+                "foo",
+                "some name",
+                "CHECK ((a IS NOT NULL)) NO INHERIT NOT VALID",
+                None,
+            ),
+        ]
+        conn = mock.Mock(
+            execute=lambda *arg, **kw: mock.MagicMock(
+                fetchall=lambda: rows, __iter__=lambda self: iter(rows)
+            )
+        )
+        check_constraints = testing.db.dialect.get_check_constraints(
+            conn, "foo"
+        )
+        eq_(
+            check_constraints,
+            [
+                {
+                    "name": "some name",
+                    "sqltext": "a IS NOT NULL",
+                    "dialect_options": {"no_inherit": True},
+                    "comment": None,
+                },
+                {
+                    "name": "some name",
+                    "sqltext": "a IS NOT NULL",
+                    "dialect_options": {"not_valid": True, "no_inherit": True},
+                    "comment": None,
+                },
             ],
         )
 

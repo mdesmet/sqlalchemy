@@ -286,7 +286,6 @@ class PoolTest(PoolTestBase):
     @testing.combinations(
         (pool.QueuePool, False),
         (pool.AsyncAdaptedQueuePool, True),
-        (pool.FallbackAsyncAdaptedQueuePool, True),
         (pool.NullPool, None),
         (pool.SingletonThreadPool, False),
         (pool.StaticPool, None),
@@ -307,7 +306,6 @@ class PoolTest(PoolTestBase):
     @testing.combinations(
         (pool.QueuePool, False),
         (pool.AsyncAdaptedQueuePool, True),
-        (pool.FallbackAsyncAdaptedQueuePool, True),
         (pool.NullPool, False),
         (pool.SingletonThreadPool, False),
         (pool.StaticPool, False),
@@ -460,8 +458,10 @@ class PoolEventsTest(PoolTestBase):
         @event.listens_for(p, "reset")
         def reset(conn, rec, state):
             canary.append(
-                f"""reset_{'rollback_ok'
-                if state.asyncio_safe else 'no_rollback'}"""
+                f"""reset_{
+                    'rollback_ok'
+                    if state.asyncio_safe else 'no_rollback'
+                }"""
             )
 
         @event.listens_for(p, "checkin")
@@ -736,9 +736,12 @@ class PoolEventsTest(PoolTestBase):
         assert canary.call_args_list[0][0][0] is dbapi_con
         assert canary.call_args_list[0][0][2] is exc
 
-    @testing.variation("is_asyncio", [True, False])
+    @testing.variation("is_asyncio", [(True, testing.requires.asyncio), False])
     @testing.variation("has_terminate", [True, False])
-    def test_checkin_event_gc(self, is_asyncio, has_terminate):
+    @testing.variation("invalidate_conn_rec", [True, False])
+    def test_checkin_event_gc(
+        self, is_asyncio, has_terminate, invalidate_conn_rec
+    ):
         """tests for #8419, which have been modified for 2.0 in #9237"""
 
         p, canary = self._checkin_event_fixture(
@@ -751,7 +754,11 @@ class PoolEventsTest(PoolTestBase):
 
         eq_(canary, [])
 
-        if is_asyncio:
+        if invalidate_conn_rec:
+            # test #10414
+            c1._connection_record.invalidate()
+
+        if is_asyncio and not invalidate_conn_rec:
             if has_terminate:
                 with expect_warnings(
                     "The garbage collector is trying to clean up.*which will "
@@ -772,7 +779,9 @@ class PoolEventsTest(PoolTestBase):
 
         detach_gced = is_asyncio
 
-        if detach_gced:
+        if invalidate_conn_rec:
+            eq_(canary, ["checkin"])
+        elif detach_gced:
             if has_terminate:
                 eq_(canary, ["reset_no_rollback", "detach", "close_detached"])
             else:
@@ -784,7 +793,7 @@ class PoolEventsTest(PoolTestBase):
             eq_(canary, ["reset_rollback_ok", "checkin"])
 
         gc_collect()
-        if detach_gced:
+        if detach_gced or invalidate_conn_rec:
             is_none(dbapi_connection())
         else:
             is_not_none(dbapi_connection())
@@ -1704,8 +1713,15 @@ class QueuePoolTest(PoolTestBase):
             exc_cls=TimeoutThing if exc_type.base_exception else Exception,
         )
 
-    @testing.combinations((True,), (False,))
-    def test_userspace_disconnectionerror_weakref_finalizer(self, detach_gced):
+    @testing.variation(
+        "detach_gced",
+        [("detached_gc", testing.requires.asyncio), "normal_gc"],
+    )
+    @testing.variation("invalidate_conn_rec", [True, False])
+    @testing.emits_warning("The garbage collector")
+    def test_userspace_disconnectionerror_weakref_finalizer(
+        self, detach_gced, invalidate_conn_rec
+    ):
         dbapi, pool = self._queuepool_dbapi_fixture(
             pool_size=1, max_overflow=2, _is_asyncio=detach_gced
         )
@@ -1736,7 +1752,12 @@ class QueuePoolTest(PoolTestBase):
         )
 
         not_closed_dbapi_conn = conn.dbapi_connection
+
+        if invalidate_conn_rec:
+            conn._connection_record.invalidate()
+
         del conn
+
         gc_collect()
 
         if detach_gced:
@@ -1744,7 +1765,14 @@ class QueuePoolTest(PoolTestBase):
             eq_(not_closed_dbapi_conn.mock_calls, [])
         else:
             # new connection reset and returned to pool
-            eq_(not_closed_dbapi_conn.mock_calls, [call.rollback()])
+            # this creates a gc-level warning that is not easy to pin down,
+            # hence we use the testing.emits_warning() decorator just to squash
+            # it
+
+            if invalidate_conn_rec:
+                eq_(not_closed_dbapi_conn.mock_calls, [call.close()])
+            else:
+                eq_(not_closed_dbapi_conn.mock_calls, [call.rollback()])
 
     @testing.requires.timing_intensive
     def test_recycle_pool_no_race(self):

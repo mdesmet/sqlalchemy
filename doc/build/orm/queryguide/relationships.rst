@@ -760,7 +760,7 @@ order to load related associations:
 .. sourcecode:: pycon+sql
 
     >>> from sqlalchemy import select
-    >>> from sqlalchemy import selectinload
+    >>> from sqlalchemy.orm import selectinload
     >>> stmt = (
     ...     select(User)
     ...     .options(selectinload(User.addresses))
@@ -798,7 +798,7 @@ value from the parent object is used:
 .. sourcecode:: pycon+sql
 
     >>> from sqlalchemy import select
-    >>> from sqlalchemy import selectinload
+    >>> from sqlalchemy.orm import selectinload
     >>> stmt = select(Address).options(selectinload(Address.user))
     >>> result = session.scalars(stmt).all()
     {execsql}SELECT
@@ -828,10 +828,10 @@ will JOIN across all three tables to match rows from one side to the other.
 Things to know about this kind of loading include:
 
 * The strategy emits a SELECT for up to 500 parent primary key values at a
-  time, as the primary keys are rendered into a large IN expression in the
-  SQL statement.   Some databases like Oracle have a hard limit on how large
-  an IN expression can be, and overall the size of the SQL string shouldn't
-  be arbitrarily large.
+  time, as the primary keys are rendered into a large IN expression in the SQL
+  statement.  Some databases like Oracle Database have a hard limit on how
+  large an IN expression can be, and overall the size of the SQL string
+  shouldn't be arbitrarily large.
 
 * As "selectin" loading relies upon IN, for a mapping with composite primary
   keys, it must use the "tuple" form of IN, which looks like ``WHERE
@@ -1001,8 +1001,7 @@ Wildcard Loading Strategies
 ---------------------------
 
 Each of :func:`_orm.joinedload`, :func:`.subqueryload`, :func:`.lazyload`,
-:func:`.selectinload`,
-:func:`.noload`, and :func:`.raiseload` can be used to set the default
+:func:`.selectinload`, and :func:`.raiseload` can be used to set the default
 style of :func:`_orm.relationship` loading
 for a particular query, affecting all :func:`_orm.relationship` -mapped
 attributes not otherwise
@@ -1132,6 +1131,17 @@ that we can opt to **modify** what values the collection is intended to store,
 by writing our SQL to load a subset of elements for collections or
 scalar attributes.
 
+.. tip::  SQLAlchemy now has a **much simpler way to do this**, by allowing
+   WHERE criteria to be added directly to loader options such as
+   :func:`_orm.joinedload`
+   and :func:`_orm.selectinload` using :meth:`.PropComparator.and_`.  See
+   the section :ref:`loader_option_criteria` for examples.
+
+   The techniques described here still apply if the related collection is
+   to be queried using SQL criteria or modifiers more complex than a simple
+   WHERE clause.
+
+
 As an example, we can load a ``User`` object and eagerly load only particular
 addresses into its ``.addresses`` collection by filtering the joined data,
 routing it using :func:`_orm.contains_eager`, also using
@@ -1172,6 +1182,11 @@ in fact associated with the collection.
    :meth:`.Session.commit`, :meth:`.Session.rollback` methods are used
    assuming default session settings, or the :meth:`.Session.expire_all`
    or :meth:`.Session.expire` methods are used.
+
+.. seealso::
+
+    :ref:`loader_option_criteria` - modern API allowing WHERE criteria directly
+    within any relationship loader option
 
 
 Relationship Loader API

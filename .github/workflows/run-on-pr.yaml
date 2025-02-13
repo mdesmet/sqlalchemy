@@ -10,7 +10,7 @@ on:
 
 env:
   # global env to all steps
-  TOX_WORKERS: -n2
+  TOX_WORKERS: -n4
 
 permissions:
   contents: read
@@ -23,9 +23,9 @@ jobs:
       # run this job using this matrix, excluding some combinations below.
       matrix:
         os:
-          - "ubuntu-latest"
+          - "ubuntu-22.04"
         python-version:
-          - "3.11"
+          - "3.12"
         build-type:
           - "cext"
           - "nocext"
@@ -37,10 +37,10 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
@@ -60,9 +60,9 @@ jobs:
     strategy:
       matrix:
         os:
-          - "ubuntu-latest"
+          - "ubuntu-22.04"
         python-version:
-          - "3.11"
+          - "3.12"
         tox-env:
           - mypy
           - lint
@@ -72,10 +72,10 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}

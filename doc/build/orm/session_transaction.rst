@@ -60,7 +60,7 @@ or rolled back::
     session.commit()  # commits
 
     # will automatically begin again
-    result = session.execute("< some select statement >")
+    result = session.execute(text("< some select statement >"))
     session.add_all([more_objects, ...])
     session.commit()  # commits
 
@@ -100,7 +100,7 @@ first::
 
         session.commit()  # commits
 
-        result = session.execute("<some SELECT statement>")
+        result = session.execute(text("<some SELECT statement>"))
 
     # remaining transactional state from the .execute() call is
     # discarded
@@ -175,7 +175,7 @@ an error is raised, the savepoint is rolled back and the state of the
 
 This pattern is ideal for situations such as using PostgreSQL and
 catching :class:`.IntegrityError` to detect duplicate rows; PostgreSQL normally
-aborts the entire tranasction when such an error is raised, however when using
+aborts the entire transaction when such an error is raised, however when using
 SAVEPOINT, the outer transaction is maintained.   In the example below
 a list of data is persisted into the database, with the occasional
 "duplicate primary key" record skipped, without rolling back the entire
@@ -474,6 +474,8 @@ order to affect transaction isolation level, we need to act upon the
     :ref:`dbapi_autocommit` - be sure to review how isolation levels work at
     the level of the SQLAlchemy :class:`_engine.Connection` object as well.
 
+.. _session_transaction_isolation_enginewide:
+
 Setting Isolation For A Sessionmaker / Engine Wide
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -527,8 +529,8 @@ used in a read-only fashion**, that is::
 
 
     with autocommit_session() as session:
-        some_objects = session.execute("<statement>")
-        some_other_objects = session.execute("<statement>")
+        some_objects = session.execute(text("<statement>"))
+        some_other_objects = session.execute(text("<statement>"))
 
     # closes connection
 
@@ -689,7 +691,6 @@ data changes throughout the test are reverted::
             self.session.commit()
 
         def test_something_with_rollbacks(self):
-
             self.session.add(Bar())
             self.session.flush()
             self.session.rollback()

@@ -63,6 +63,12 @@ of the columns to be generated, in this case the names; the
         def __repr__(self):
             return f"Vertex(start={self.start}, end={self.end})"
 
+.. tip:: In the example above the columns that represent the composites
+    (``x1``, ``y1``, etc.) are also accessible on the class but are not
+    correctly understood by type checkers.
+    If accessing the single columns is important they can be explicitly declared,
+    as shown in :ref:`composite_with_typing`.
+
 The above mapping would correspond to a CREATE TABLE statement as:
 
 .. sourcecode:: pycon+sql
@@ -84,7 +90,7 @@ Working with Mapped Composite Column Types
 
 With a mapping as illustrated in the top section, we can work with the
 ``Vertex`` class, where the ``.start`` and ``.end`` attributes will
-transparently refer to the columns referred towards by the ``Point`` class, as
+transparently refer to the columns referenced by the ``Point`` class, as
 well as with instances of the ``Vertex`` class, where the ``.start`` and
 ``.end`` attributes will refer to instances of the ``Point`` class. The ``x1``,
 ``y1``, ``x2``, and ``y2`` columns are handled transparently:
@@ -182,14 +188,15 @@ Other mapping forms for composites
 The :func:`_orm.composite` construct may be passed the relevant columns
 using a :func:`_orm.mapped_column` construct, a :class:`_schema.Column`,
 or the string name of an existing mapped column.   The following examples
-illustrate an equvalent mapping as that of the main section above.
+illustrate an equivalent mapping as that of the main section above.
 
-* Map columns directly, then pass to composite
+Map columns directly, then pass to composite
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  Here we pass the existing :func:`_orm.mapped_column` instances to the
-  :func:`_orm.composite` construct, as in the non-annotated example below
-  where we also pass the ``Point`` class as the first argument to
-  :func:`_orm.composite`::
+Here we pass the existing :func:`_orm.mapped_column` instances to the
+:func:`_orm.composite` construct, as in the non-annotated example below
+where we also pass the ``Point`` class as the first argument to
+:func:`_orm.composite`::
 
     from sqlalchemy import Integer
     from sqlalchemy.orm import mapped_column, composite
@@ -207,11 +214,14 @@ illustrate an equvalent mapping as that of the main section above.
         start = composite(Point, x1, y1)
         end = composite(Point, x2, y2)
 
-* Map columns directly, pass attribute names to composite
+.. _composite_with_typing:
 
-  We can write the same example above using more annotated forms where we have
-  the option to pass attribute names to :func:`_orm.composite` instead of
-  full column constructs::
+Map columns directly, pass attribute names to composite
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+We can write the same example above using more annotated forms where we have
+the option to pass attribute names to :func:`_orm.composite` instead of
+full column constructs::
 
     from sqlalchemy.orm import mapped_column, composite, Mapped
 
@@ -228,12 +238,13 @@ illustrate an equvalent mapping as that of the main section above.
         start: Mapped[Point] = composite("x1", "y1")
         end: Mapped[Point] = composite("x2", "y2")
 
-* Imperative mapping and imperative table
+Imperative mapping and imperative table
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-  When using :ref:`imperative table <orm_imperative_table_configuration>` or
-  fully :ref:`imperative <orm_imperative_mapping>` mappings, we have access
-  to :class:`_schema.Column` objects directly.  These may be passed to
-  :func:`_orm.composite` as well, as in the imperative example below::
+When using :ref:`imperative table <orm_imperative_table_configuration>` or
+fully :ref:`imperative <orm_imperative_mapping>` mappings, we have access
+to :class:`_schema.Column` objects directly.  These may be passed to
+:func:`_orm.composite` as well, as in the imperative example below::
 
      mapper_registry.map_imperatively(
          Vertex,
@@ -399,7 +410,11 @@ For the purposes of the example, the ``Vertex`` composite is then mapped to a
 class called ``HasVertex``, which is where the :class:`.Table` containing the
 four source columns ultimately resides::
 
+    from __future__ import annotations
+
     import dataclasses
+    from typing import Any
+    from typing import Tuple
 
     from sqlalchemy.orm import composite
     from sqlalchemy.orm import DeclarativeBase
@@ -419,11 +434,11 @@ four source columns ultimately resides::
         end: Point
 
         @classmethod
-        def _generate(self, x1, y1, x2, y2):
+        def _generate(cls, x1: int, y1: int, x2: int, y2: int) -> Vertex:
             """generate a Vertex from a row"""
             return Vertex(Point(x1, y1), Point(x2, y2))
 
-        def __composite_values__(self):
+        def __composite_values__(self) -> Tuple[Any, ...]:
             """generate a row from a Vertex"""
             return dataclasses.astuple(self.start) + dataclasses.astuple(self.end)
 

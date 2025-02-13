@@ -27,6 +27,44 @@ Glossary
 
             :ref:`migration_20_toplevel`
 
+    sentinel
+    insert sentinel
+        This is a SQLAlchemy-specific term that refers to a
+        :class:`_schema.Column` which can be used for a bulk
+        :term:`insertmanyvalues` operation to track INSERTed data records
+        against rows passed back using RETURNING or similar.   Such a
+        column configuration is necessary for those cases when the
+        :term:`insertmanyvalues` feature does an optimized INSERT..RETURNING
+        statement for many rows at once while still being able to guarantee the
+        order of returned rows matches the input data.
+
+        For typical use cases, the SQLAlchemy SQL compiler can automatically
+        make use of surrogate integer primary key columns as "insert
+        sentinels", and no user-configuration is required.  For less common
+        cases with other varieties of server-generated primary key values,
+        explicit "insert sentinel" columns may be optionally configured within
+        :term:`table metadata` in order to optimize INSERT statements that
+        are inserting many rows at once.
+
+        .. seealso::
+
+            :ref:`engine_insertmanyvalues_returning_order` - in the section
+            :ref:`engine_insertmanyvalues`
+
+    insertmanyvalues
+        This refers to a SQLAlchemy-specific feature which allows INSERT
+        statements to emit thousands of new rows within a single statement
+        while at the same time allowing server generated values to be returned
+        inline from the statement using RETURNING or similar, for performance
+        optimization purposes. The feature is intended to be transparently
+        available for selected backends, but does offer some configurational
+        options. See the section :ref:`engine_insertmanyvalues` for a full
+        description of this feature.
+
+        .. seealso::
+
+            :ref:`engine_insertmanyvalues`
+
     mixin class
     mixin classes
 
@@ -260,13 +298,13 @@ Glossary
         A key limitation of the ``cursor.executemany()`` method as used with
         all known DBAPIs is that the ``cursor`` is not configured to return
         rows when this method is used.  For **most** backends (a notable
-        exception being the cx_Oracle, / OracleDB DBAPIs), this means that
+        exception being the python-oracledb / cx_Oracle DBAPIs), this means that
         statements like ``INSERT..RETURNING`` typically cannot be used with
         ``cursor.executemany()`` directly, since DBAPIs typically do not
         aggregate the single row from each INSERT execution together.
 
         To overcome this limitation, SQLAlchemy as of the 2.0 series implements
-        an alternative form of "executemany" which is referred towards as
+        an alternative form of "executemany" which is known as
         :ref:`engine_insertmanyvalues`. This feature makes use of
         ``cursor.execute()`` to invoke an INSERT statement that will proceed
         with multiple parameter sets in one round trip, thus producing the same
@@ -402,6 +440,8 @@ Glossary
         .. seealso::
 
             `Metadata Mapping (via Martin Fowler) <https://www.martinfowler.com/eaaCatalog/metadataMapping.html>`_
+
+            :ref:`tutorial_working_with_metadata`  - in the :ref:`unified_tutorial`
 
     version id column
         In SQLAlchemy, this refers to the use of a particular table column that
@@ -771,6 +811,19 @@ Glossary
 
             :ref:`session_basics`
 
+    flush
+    flushing
+    flushed
+
+        This refers to the actual process used by the :term:`unit of work`
+        to emit changes to a database.  In SQLAlchemy this process occurs
+        via the :class:`_orm.Session` object and is usually automatic, but
+        can also be controlled manually.
+
+        .. seealso::
+
+            :ref:`session_flushing`
+
     expire
     expired
     expires
@@ -998,7 +1051,6 @@ Glossary
 
     isolation
     isolated
-    Isolation
     isolation level
         The isolation property of the :term:`ACID` model
         ensures that the concurrent execution
@@ -1106,16 +1158,17 @@ Glossary
         values as they are not included otherwise (but note any series of columns
         or SQL expressions can be placed into RETURNING, not just default-value columns).
 
-        The backends that currently support
-        RETURNING or a similar construct are PostgreSQL, SQL Server, Oracle,
-        and Firebird.    The PostgreSQL and Firebird implementations are generally
-        full featured, whereas the implementations of SQL Server and Oracle
-        have caveats. On SQL Server, the clause is known as "OUTPUT INSERTED"
-        for INSERT and UPDATE statements and "OUTPUT DELETED" for DELETE statements;
-        the key caveat is that triggers are not supported in conjunction with this
-        keyword.  On Oracle, it is known as "RETURNING...INTO", and requires that the
-        value be placed into an OUT parameter, meaning not only is the syntax awkward,
-        but it can also only be used for one row at a time.
+        The backends that currently support RETURNING or a similar construct
+        are PostgreSQL, SQL Server, Oracle Database, and Firebird.  The
+        PostgreSQL and Firebird implementations are generally full featured,
+        whereas the implementations of SQL Server and Oracle Database have
+        caveats. On SQL Server, the clause is known as "OUTPUT INSERTED" for
+        INSERT and UPDATE statements and "OUTPUT DELETED" for DELETE
+        statements; the key caveat is that triggers are not supported in
+        conjunction with this keyword.  In Oracle Database, it is known as
+        "RETURNING...INTO", and requires that the value be placed into an OUT
+        parameter, meaning not only is the syntax awkward, but it can also only
+        be used for one row at a time.
 
         SQLAlchemy's :meth:`.UpdateBase.returning` system provides a layer of abstraction
         on top of the RETURNING systems of these backends to provide a consistent
@@ -1650,4 +1703,3 @@ Glossary
         .. seealso::
 
             :ref:`session_object_states`
-

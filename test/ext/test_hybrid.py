@@ -7,6 +7,7 @@ from sqlalchemy import func
 from sqlalchemy import insert
 from sqlalchemy import inspect
 from sqlalchemy import Integer
+from sqlalchemy import LABEL_STYLE_DISAMBIGUATE_ONLY
 from sqlalchemy import LABEL_STYLE_TABLENAME_PLUS_COL
 from sqlalchemy import literal_column
 from sqlalchemy import Numeric
@@ -15,11 +16,15 @@ from sqlalchemy import String
 from sqlalchemy import testing
 from sqlalchemy.ext import hybrid
 from sqlalchemy.orm import aliased
+from sqlalchemy.orm import column_property
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import declared_attr
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import synonym
+from sqlalchemy.sql import coercions
 from sqlalchemy.sql import operators
+from sqlalchemy.sql import roles
 from sqlalchemy.sql import update
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
@@ -419,6 +424,76 @@ class PropertyExpressionTest(fixtures.TestBase, AssertsCompiledSQL):
 
         return A
 
+    @testing.fixture
+    def _unnamed_expr_matches_col_fixture(self):
+        Base = declarative_base()
+
+        class A(Base):
+            __tablename__ = "a"
+            id = Column(Integer, primary_key=True)
+            foo = Column(String)
+
+            @hybrid.hybrid_property
+            def bar(self):
+                return self.foo
+
+        return A
+
+    def test_access_from_unmapped(self):
+        """test #9519"""
+
+        class DnsRecord:
+            name = Column("name", String)
+
+            @hybrid.hybrid_property
+            def ip_value(self):
+                return self.name[1:3]
+
+            @ip_value.expression
+            def ip_value(cls):
+                return func.substring(cls.name, 1, 3)
+
+        raw_attr = DnsRecord.ip_value
+        is_(raw_attr._parententity, None)
+
+        self.assert_compile(
+            raw_attr, "substring(name, :substring_1, :substring_2)"
+        )
+
+        self.assert_compile(
+            select(DnsRecord.ip_value),
+            "SELECT substring(name, :substring_2, :substring_3) "
+            "AS substring_1",
+        )
+
+    def test_access_from_not_yet_mapped(self, decl_base):
+        """test #9519"""
+
+        class DnsRecord(decl_base):
+            __tablename__ = "dnsrecord"
+            id = Column(Integer, primary_key=True)
+            name = Column(String, unique=False, nullable=False)
+
+            @declared_attr
+            def thing(cls):
+                return column_property(cls.ip_value)
+
+            name = Column("name", String)
+
+            @hybrid.hybrid_property
+            def ip_value(self):
+                return self.name[1:3]
+
+            @ip_value.expression
+            def ip_value(cls):
+                return func.substring(cls.name, 1, 3)
+
+        self.assert_compile(
+            select(DnsRecord.thing),
+            "SELECT substring(dnsrecord.name, :substring_2, :substring_3) "
+            "AS substring_1 FROM dnsrecord",
+        )
+
     def test_labeling_for_unnamed(self, _unnamed_expr_fixture):
         A = _unnamed_expr_fixture
 
@@ -436,6 +511,39 @@ class PropertyExpressionTest(fixtures.TestBase, AssertsCompiledSQL):
             "SELECT anon_1.id, anon_1.name "
             "FROM (SELECT a.id AS id, a.firstname || :firstname_1 || "
             "a.lastname AS name FROM a) AS anon_1",
+        )
+
+    @testing.variation("pre_populate_col_proxy", [True, False])
+    def test_labeling_for_unnamed_matches_col(
+        self, _unnamed_expr_matches_col_fixture, pre_populate_col_proxy
+    ):
+        """test #11728"""
+
+        A = _unnamed_expr_matches_col_fixture
+
+        if pre_populate_col_proxy:
+            pre_stmt = select(A.id, A.foo)
+            pre_stmt.subquery().c
+
+        stmt = select(A.id, A.bar)
+        self.assert_compile(
+            stmt,
+            "SELECT a.id, a.foo FROM a",
+        )
+
+        compile_state = stmt._compile_state_factory(stmt, None)
+        eq_(
+            compile_state._column_naming_convention(
+                LABEL_STYLE_DISAMBIGUATE_ONLY, legacy=False
+            )(list(stmt.inner_columns)[1]),
+            "bar",
+        )
+        eq_(stmt.subquery().c.keys(), ["id", "bar"])
+
+        self.assert_compile(
+            select(stmt.subquery()),
+            "SELECT anon_1.id, anon_1.foo FROM "
+            "(SELECT a.id AS id, a.foo AS foo FROM a) AS anon_1",
         )
 
     def test_labeling_for_unnamed_tablename_plus_col(
@@ -520,8 +628,6 @@ class PropertyExpressionTest(fixtures.TestBase, AssertsCompiledSQL):
 
     def test_expression_isnt_clause_element(self):
         A = self._wrong_expr_fixture()
-
-        from sqlalchemy.sql import coercions, roles
 
         with testing.expect_raises_message(
             exc.InvalidRequestError,

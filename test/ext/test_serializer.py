@@ -18,8 +18,10 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.orm import scoped_session
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.testing import AssertsCompiledSQL
+from sqlalchemy.testing import combinations
 from sqlalchemy.testing import eq_
 from sqlalchemy.testing import fixtures
+from sqlalchemy.testing.entities import ComparableEntity
 from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.schema import Table
 
@@ -29,16 +31,15 @@ def pickle_protocols():
     # return iter([-1, 0, 1, 2])
 
 
-class User(fixtures.ComparableEntity):
+class User(ComparableEntity):
     pass
 
 
-class Address(fixtures.ComparableEntity):
+class Address(ComparableEntity):
     pass
 
 
 class SerializeTest(AssertsCompiledSQL, fixtures.MappedTest):
-
     run_setup_mappers = "once"
     run_inserts = "once"
     run_deletes = None
@@ -279,6 +280,34 @@ class SerializeTest(AssertsCompiledSQL, fixtures.MappedTest):
             dialect="default",
         )
 
+    @combinations(
+        (
+            lambda: func.max(users.c.name).over(range_=(None, 0)),
+            "max(users.name) OVER (RANGE BETWEEN UNBOUNDED "
+            "PRECEDING AND CURRENT ROW)",
+        ),
+        (
+            lambda: func.max(users.c.name).over(range_=(0, None)),
+            "max(users.name) OVER (RANGE BETWEEN CURRENT "
+            "ROW AND UNBOUNDED FOLLOWING)",
+        ),
+        (
+            lambda: func.max(users.c.name).over(rows=(None, 0)),
+            "max(users.name) OVER (ROWS BETWEEN UNBOUNDED "
+            "PRECEDING AND CURRENT ROW)",
+        ),
+        (
+            lambda: func.max(users.c.name).over(rows=(0, None)),
+            "max(users.name) OVER (ROWS BETWEEN CURRENT "
+            "ROW AND UNBOUNDED FOLLOWING)",
+        ),
+    )
+    def test_over(self, over_fn, sql):
+        o = over_fn()
+        self.assert_compile(o, sql)
+        ol = serializer.loads(serializer.dumps(o), users.metadata)
+        self.assert_compile(ol, sql)
+
 
 class ColumnPropertyWParamTest(
     AssertsCompiledSQL, fixtures.DeclarativeMappedTest
@@ -331,7 +360,3 @@ class ColumnPropertyWParamTest(
             "CAST(left(test.some_id, :left_2) AS INTEGER) = :param_1",
             checkparams={"left_1": 6, "left_2": 6, "param_1": 123456},
         )
-
-
-if __name__ == "__main__":
-    testing.main()
