@@ -1,3 +1,6 @@
+import operator
+import sys
+
 from sqlalchemy import exc
 from sqlalchemy import testing
 from sqlalchemy.engine import result
@@ -7,7 +10,11 @@ from sqlalchemy.testing import eq_
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing import is_false
 from sqlalchemy.testing import is_true
+from sqlalchemy.testing.assertions import expect_deprecated
+from sqlalchemy.testing.assertions import expect_raises
 from sqlalchemy.testing.util import picklers
+from sqlalchemy.util import compat
+from sqlalchemy.util.langhelpers import load_uncompiled_module
 
 
 class ResultTupleTest(fixtures.TestBase):
@@ -64,7 +71,12 @@ class ResultTupleTest(fixtures.TestBase):
     def test_slices_arent_in_mappings(self):
         keyed_tuple = self._fixture([1, 2], ["a", "b"])
 
-        assert_raises(TypeError, lambda: keyed_tuple._mapping[0:2])
+        if compat.py312:
+            with expect_raises(KeyError):
+                keyed_tuple._mapping[0:2]
+        else:
+            with expect_raises(TypeError):
+                keyed_tuple._mapping[0:2]
 
     def test_integers_arent_in_mappings(self):
         keyed_tuple = self._fixture([1, 2], ["a", "b"])
@@ -88,7 +100,6 @@ class ResultTupleTest(fixtures.TestBase):
 
         # row as tuple getter doesn't accept ints.  for ints, just
         # use plain python
-        import operator
 
         getter = operator.itemgetter(2, 0, 1)
 
@@ -182,7 +193,6 @@ class ResultTupleTest(fixtures.TestBase):
         assert_raises(TypeError, should_raise)
 
     def test_serialize(self):
-
         keyed_tuple = self._fixture([1, 2, 3], ["a", None, "b"])
 
         for loads, dumps in picklers():
@@ -194,36 +204,89 @@ class ResultTupleTest(fixtures.TestBase):
             eq_(kt._fields, ("a", "b"))
             eq_(kt._asdict(), {"a": 1, "b": 3})
 
+    @testing.fixture
+    def _load_module(self):
+        from sqlalchemy.engine import _row_cy as _cy_row
+
+        _py_row = load_uncompiled_module(_cy_row)
+
+        # allow pickle to serialize the two rowproxy_reconstructor functions
+        # create a new virtual module
+        new_name = _py_row.__name__ + "py_only"
+        sys.modules[new_name] = _py_row
+        _py_row.__name__ = new_name
+        for item in vars(_py_row).values():
+            # only the rowproxy_reconstructor module is required to change,
+            # but set every one for consistency
+            if getattr(item, "__module__", None) == _cy_row.__name__:
+                item.__module__ = new_name
+        yield _cy_row, _py_row
+        sys.modules.pop(new_name)
+
     @testing.requires.cextensions
-    def test_serialize_cy_py_cy(self):
-        from sqlalchemy.engine._py_row import BaseRow as _PyRow
-        from sqlalchemy.cyextension.resultproxy import BaseRow as _CyRow
+    @testing.variation("direction", ["py_to_cy", "cy_to_py"])
+    def test_serialize_cy_py_cy(
+        self, direction: testing.Variation, _load_module
+    ):
+        _cy_row, _py_row = _load_module
 
         global Row
 
-        p = result.SimpleResultMetaData(["a", None, "b"])
+        p = result.SimpleResultMetaData(["a", "w", "b"])
+
+        if direction.py_to_cy:
+            dump_cls = _py_row.BaseRow
+            load_cls = _cy_row.BaseRow
+        elif direction.cy_to_py:
+            dump_cls = _cy_row.BaseRow
+            load_cls = _py_row.BaseRow
+        else:
+            direction.fail()
 
         for loads, dumps in picklers():
 
-            class Row(_CyRow):
+            class Row(dump_cls):
                 pass
 
-            row = Row(p, p._processors, p._keymap, 0, (1, 2, 3))
+            row = Row(p, p._processors, p._key_to_index, (1, 2, 3))
 
             state = dumps(row)
 
-            class Row(_PyRow):
+            class Row(load_cls):
                 pass
 
             row2 = loads(state)
-            is_true(isinstance(row2, _PyRow))
+            is_true(isinstance(row2, load_cls))
+            is_false(isinstance(row2, dump_cls))
             state2 = dumps(row2)
 
-            class Row(_CyRow):
+            class Row(dump_cls):
                 pass
 
             row3 = loads(state2)
-            is_true(isinstance(row3, _CyRow))
+            is_true(isinstance(row3, dump_cls))
+
+    def test_processors(self):
+        parent = result.SimpleResultMetaData(["a", "b", "c", "d"])
+        data = (1, 99, "42", "foo")
+        row_none = result.Row(parent, None, parent._key_to_index, data)
+        eq_(row_none._to_tuple_instance(), data)
+        row_all_p = result.Row(
+            parent, [str, float, int, str.upper], parent._key_to_index, data
+        )
+        eq_(row_all_p._to_tuple_instance(), ("1", 99.0, 42, "FOO"))
+        row_some_p = result.Row(
+            parent, [None, str, None, str.upper], parent._key_to_index, data
+        )
+        eq_(row_some_p._to_tuple_instance(), (1, "99", "42", "FOO"))
+        with expect_raises(AssertionError):
+            result.Row(parent, [None, str], parent._key_to_index, data)
+
+    def test_tuplegetter(self):
+        data = list(range(10, 20))
+        eq_(result.tuplegetter(1)(data), [11])
+        eq_(result.tuplegetter(1, 9, 3)(data), (11, 19, 13))
+        eq_(result.tuplegetter(2, 3, 4)(data), [12, 13, 14])
 
 
 class ResultTest(fixtures.TestBase):
@@ -235,7 +298,6 @@ class ResultTest(fixtures.TestBase):
         default_filters=None,
         data=None,
     ):
-
         if data is None:
             data = [(1, 1, 1), (2, 1, 2), (1, 3, 2), (4, 1, 2)]
         if num_rows is not None:
@@ -291,6 +353,7 @@ class ResultTest(fixtures.TestBase):
         eq_(m1.fetchone(), {"a": 1, "b": 1, "c": 1})
         eq_(r1.fetchone(), (2, 1, 2))
 
+    @expect_deprecated(".*is deprecated, Row now behaves like a tuple.*")
     def test_tuples_plus_base(self):
         r1 = self._fixture()
 
@@ -923,7 +986,6 @@ class ResultTest(fixtures.TestBase):
 class MergeResultTest(fixtures.TestBase):
     @testing.fixture
     def merge_fixture(self):
-
         r1 = result.IteratorResult(
             result.SimpleResultMetaData(["user_id", "user_name"]),
             iter([(7, "u1"), (8, "u2")]),
@@ -945,7 +1007,6 @@ class MergeResultTest(fixtures.TestBase):
 
     @testing.fixture
     def dupe_fixture(self):
-
         r1 = result.IteratorResult(
             result.SimpleResultMetaData(["x", "y", "z"]),
             iter([(1, 2, 1), (2, 2, 1)]),

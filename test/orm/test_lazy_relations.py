@@ -21,7 +21,9 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import configure_mappers
 from sqlalchemy.orm import exc as orm_exc
+from sqlalchemy.orm import foreign
 from sqlalchemy.orm import relationship
+from sqlalchemy.orm import remote
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import with_parent
 from sqlalchemy.testing import assert_raises
@@ -32,6 +34,7 @@ from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_false
 from sqlalchemy.testing import is_true
 from sqlalchemy.testing.assertsql import CompiledSQL
+from sqlalchemy.testing.entities import ComparableEntity
 from sqlalchemy.testing.fixtures import fixture_session
 from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.schema import Table
@@ -473,7 +476,6 @@ class LazyTest(_fixtures.FixtureTest):
         )
 
     def test_double_w_ac_against_subquery(self):
-
         (
             users,
             orders,
@@ -532,7 +534,6 @@ class LazyTest(_fixtures.FixtureTest):
         self._run_double_test()
 
     def test_double_w_ac(self):
-
         (
             users,
             orders,
@@ -754,7 +755,6 @@ class LazyTest(_fixtures.FixtureTest):
             )
 
             with fixture_session() as sess:
-
                 # load address
                 a1 = (
                     sess.query(Address)
@@ -995,7 +995,6 @@ class LazyTest(_fixtures.FixtureTest):
 
 
 class GetterStateTest(_fixtures.FixtureTest):
-
     """test lazyloader on non-existent attribute returns
     expected attribute symbols, maintain expected state"""
 
@@ -1028,10 +1027,10 @@ class GetterStateTest(_fixtures.FixtureTest):
             Column("data", MyHashType()),
         )
 
-        class Category(fixtures.ComparableEntity):
+        class Category(ComparableEntity):
             pass
 
-        class Article(fixtures.ComparableEntity):
+        class Article(ComparableEntity):
             pass
 
         self.mapper_registry.map_imperatively(Category, category)
@@ -1082,11 +1081,13 @@ class GetterStateTest(_fixtures.FixtureTest):
             properties={
                 "user": relationship(
                     User,
-                    primaryjoin=and_(
-                        users.c.id == addresses.c.user_id, users.c.id != 27
-                    )
-                    if dont_use_get
-                    else None,
+                    primaryjoin=(
+                        and_(
+                            users.c.id == addresses.c.user_id, users.c.id != 27
+                        )
+                        if dont_use_get
+                        else None
+                    ),
                     back_populates="addresses",
                 )
             },
@@ -1271,6 +1272,54 @@ class M2OGetTest(_fixtures.FixtureTest):
 
         self.assert_sql_count(testing.db, go, 1)
 
+    @testing.fixture()
+    def composite_overlapping_fixture(self, decl_base, connection):
+        def go(allow_partial_pks):
+
+            class Section(decl_base):
+                __tablename__ = "sections"
+                year = Column(Integer, primary_key=True)
+                idx = Column(Integer, primary_key=True)
+                parent_idx = Column(Integer)
+
+                if not allow_partial_pks:
+                    __mapper_args__ = {"allow_partial_pks": False}
+
+                ForeignKeyConstraint((year, parent_idx), (year, idx))
+
+                parent = relationship(
+                    "Section",
+                    primaryjoin=and_(
+                        year == remote(year),
+                        foreign(parent_idx) == remote(idx),
+                    ),
+                )
+
+            decl_base.metadata.create_all(connection)
+            connection.commit()
+
+            with Session(connection) as sess:
+                sess.add(Section(year=5, idx=1, parent_idx=None))
+                sess.commit()
+
+            return Section
+
+        return go
+
+    @testing.variation("allow_partial_pks", [True, False])
+    def test_composite_m2o_load_partial_pks(
+        self, allow_partial_pks, composite_overlapping_fixture
+    ):
+        Section = composite_overlapping_fixture(allow_partial_pks)
+
+        session = fixture_session()
+        section = session.get(Section, (5, 1))
+
+        with self.assert_statement_count(
+            testing.db, 1 if allow_partial_pks else 0
+        ):
+            testing.is_none(section.parent)
+
 
 class CorrelatedTest(fixtures.MappedTest):
     @classmethod
@@ -1317,10 +1366,10 @@ class CorrelatedTest(fixtures.MappedTest):
     def test_correlated_lazyload(self):
         stuff, user_t = self.tables.stuff, self.tables.user_t
 
-        class User(fixtures.ComparableEntity):
+        class User(ComparableEntity):
             pass
 
-        class Stuff(fixtures.ComparableEntity):
+        class Stuff(ComparableEntity):
             pass
 
         self.mapper_registry.map_imperatively(Stuff, stuff)

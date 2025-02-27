@@ -1,6 +1,10 @@
 import datetime
 import decimal
 from enum import Enum as _PY_Enum
+from ipaddress import IPv4Address
+from ipaddress import IPv4Network
+from ipaddress import IPv6Address
+from ipaddress import IPv6Network
 import re
 import uuid
 
@@ -16,6 +20,7 @@ from sqlalchemy import Enum
 from sqlalchemy import exc
 from sqlalchemy import Float
 from sqlalchemy import func
+from sqlalchemy import insert
 from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import literal
@@ -38,6 +43,12 @@ from sqlalchemy import util
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.dialects.postgresql import array
+from sqlalchemy.dialects.postgresql import array_agg
+from sqlalchemy.dialects.postgresql import asyncpg
+from sqlalchemy.dialects.postgresql import base
+from sqlalchemy.dialects.postgresql import BIT
+from sqlalchemy.dialects.postgresql import BYTEA
+from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.dialects.postgresql import DATEMULTIRANGE
 from sqlalchemy.dialects.postgresql import DATERANGE
 from sqlalchemy.dialects.postgresql import DOMAIN
@@ -53,11 +64,17 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import NamedType
 from sqlalchemy.dialects.postgresql import NUMMULTIRANGE
 from sqlalchemy.dialects.postgresql import NUMRANGE
+from sqlalchemy.dialects.postgresql import pg8000
+from sqlalchemy.dialects.postgresql import psycopg
+from sqlalchemy.dialects.postgresql import psycopg2
+from sqlalchemy.dialects.postgresql import psycopg2cffi
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.dialects.postgresql import TSMULTIRANGE
 from sqlalchemy.dialects.postgresql import TSRANGE
 from sqlalchemy.dialects.postgresql import TSTZMULTIRANGE
 from sqlalchemy.dialects.postgresql import TSTZRANGE
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql.ranges import MultiRange
 from sqlalchemy.exc import CompileError
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import declarative_base
@@ -77,12 +94,52 @@ from sqlalchemy.testing.assertions import AssertsExecutionResults
 from sqlalchemy.testing.assertions import ComparesTables
 from sqlalchemy.testing.assertions import eq_
 from sqlalchemy.testing.assertions import is_
+from sqlalchemy.testing.assertions import ne_
 from sqlalchemy.testing.assertsql import RegexSQL
 from sqlalchemy.testing.schema import pep435_enum
 from sqlalchemy.testing.suite import test_types as suite
 from sqlalchemy.testing.util import round_decimal
 from sqlalchemy.types import UserDefinedType
 from ...engine.test_ddlevents import DDLEventWCreateHarness
+
+
+class MiscTypesTest(AssertsCompiledSQL, fixtures.TestBase):
+    __dialect__ = postgresql.dialect()
+
+    @testing.combinations(
+        ("asyncpg", "x LIKE $1::VARCHAR"),
+        ("psycopg", "x LIKE %(x_1)s::VARCHAR"),
+        ("psycopg2", "x LIKE %(x_1)s"),
+        ("pg8000", "x LIKE %s::VARCHAR"),
+    )
+    def test_string_coercion_no_len(self, driver, expected):
+        """test #9511.
+
+        comparing to string does not include length in the cast for those
+        dialects that require a cast.
+
+        """
+
+        self.assert_compile(
+            column("x", String(2)).like("%a%"),
+            expected,
+            dialect=f"postgresql+{driver}",
+        )
+
+    @testing.combinations(
+        ("sa", sqltypes.Float(), "FLOAT"),  # ideally it should render real
+        ("sa", sqltypes.Double(), "DOUBLE PRECISION"),
+        ("sa", sqltypes.FLOAT(), "FLOAT"),
+        ("sa", sqltypes.REAL(), "REAL"),
+        ("sa", sqltypes.DOUBLE(), "DOUBLE"),
+        ("sa", sqltypes.DOUBLE_PRECISION(), "DOUBLE PRECISION"),
+        ("pg", postgresql.FLOAT(), "FLOAT"),
+        ("pg", postgresql.DOUBLE_PRECISION(), "DOUBLE PRECISION"),
+        ("pg", postgresql.REAL(), "REAL"),
+        id_="ira",
+    )
+    def test_float_type_compile(self, type_, sql_text):
+        self.assert_compile(type_, sql_text)
 
 
 class FloatCoercionTest(fixtures.TablesTest, AssertsExecutionResults):
@@ -201,6 +258,25 @@ class NamedTypeTest(
         is_(e1.native_enum, True)
         is_(e2.native_enum, True)
         is_(e3.native_enum, True)
+
+    @testing.combinations(
+        ("name", "foobar", "name"),
+        ("validate_strings", True, "validate_strings"),
+        ("omit_aliases", False, "_omit_aliases"),
+        ("create_type", False, "create_type"),
+        ("create_type", True, "create_type"),
+        ("schema", "someschema", "schema"),
+        ("inherit_schema", True, "inherit_schema"),
+        ("metadata", MetaData(), "metadata"),
+        ("values_callable", lambda x: None, "values_callable"),
+    )
+    def test_enum_copy_args(self, argname, value, attrname):
+        kw = {argname: value}
+        e1 = ENUM("a", "b", "c", **kw)
+
+        e1_copy = e1.copy()
+
+        eq_(getattr(e1_copy, attrname), value)
 
     def test_enum_create_table(self, metadata, connection):
         metadata = self.metadata
@@ -439,7 +515,6 @@ class NamedTypeTest(
                 ],
             )
         elif datatype == "domain":
-
             def_schame = testing.config.db.dialect.default_schema_name
             eq_(
                 inspect(connection).get_domains(schema=assert_schema),
@@ -457,11 +532,92 @@ class NamedTypeTest(
                                 "check": r"VALUE ~ '[^@]+@[^@]+\.[^@]+'::text",
                             }
                         ],
+                        "collation": "default",
                     }
                 ],
             )
         else:
             assert False
+
+    @testing.variation("name", ["noname", "nonename", "explicit_name"])
+    @testing.variation("enum_type", ["pg", "plain"])
+    def test_native_enum_string_from_pep435(self, name, enum_type):
+        """test #9611"""
+
+        class MyEnum(_PY_Enum):
+            one = "one"
+            two = "two"
+
+        if enum_type.plain:
+            cls = Enum
+        elif enum_type.pg:
+            cls = ENUM
+        else:
+            enum_type.fail()
+
+        if name.noname:
+            e1 = cls(MyEnum)
+            eq_(e1.name, "myenum")
+        elif name.nonename:
+            e1 = cls(MyEnum, name=None)
+            eq_(e1.name, None)
+        elif name.explicit_name:
+            e1 = cls(MyEnum, name="abc")
+            eq_(e1.name, "abc")
+
+    @testing.variation("backend_type", ["native", "non_native", "pg_native"])
+    @testing.variation("enum_type", ["pep435", "str"])
+    def test_compare_to_string_round_trip(
+        self, connection, backend_type, enum_type, metadata
+    ):
+        """test #9621"""
+
+        if enum_type.pep435:
+
+            class MyEnum(_PY_Enum):
+                one = "one"
+                two = "two"
+
+            if backend_type.pg_native:
+                typ = ENUM(MyEnum, name="myenum2")
+            else:
+                typ = Enum(
+                    MyEnum,
+                    native_enum=bool(backend_type.native),
+                    name="myenum2",
+                )
+            data = [{"someenum": MyEnum.one}, {"someenum": MyEnum.two}]
+            expected = MyEnum.two
+        elif enum_type.str:
+            if backend_type.pg_native:
+                typ = ENUM("one", "two", name="myenum2")
+            else:
+                typ = Enum(
+                    "one",
+                    "two",
+                    native_enum=bool(backend_type.native),
+                    name="myenum2",
+                )
+            data = [{"someenum": "one"}, {"someenum": "two"}]
+            expected = "two"
+        else:
+            enum_type.fail()
+
+        enum_table = Table(
+            "et2",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("someenum", typ),
+        )
+        metadata.create_all(connection)
+
+        connection.execute(insert(enum_table), data)
+        expr = select(enum_table.c.someenum).where(
+            enum_table.c.someenum == "two"
+        )
+
+        row = connection.execute(expr).one()
+        eq_(row, (expected,))
 
     @testing.combinations(
         (Enum("one", "two", "three")),
@@ -476,7 +632,6 @@ class NamedTypeTest(
         argnames="datatype",
     )
     def test_name_required(self, metadata, connection, datatype):
-
         assert_raises(exc.CompileError, datatype.create, connection)
         assert_raises(
             exc.CompileError, datatype.compile, dialect=connection.dialect
@@ -762,7 +917,6 @@ class NamedTypeTest(
         ]
 
     def test_generate_multiple_on_metadata(self, connection, metadata):
-
         e1 = Enum("one", "two", "three", name="myenum", metadata=metadata)
 
         t1 = Table("e1", metadata, Column("c1", e1))
@@ -783,7 +937,6 @@ class NamedTypeTest(
     def test_generate_multiple_schemaname_on_metadata(
         self, metadata, connection
     ):
-
         Enum("one", "two", "three", name="myenum", metadata=metadata)
         Enum(
             "one",
@@ -810,7 +963,6 @@ class NamedTypeTest(
         ]
 
     def test_create_drop_schema_translate_map(self, connection):
-
         conn = connection.execution_options(
             schema_translate_map={None: testing.config.test_schema}
         )
@@ -925,7 +1077,7 @@ class NamedTypeTest(
                 connection, "fourfivesixtype"
             )
 
-    def test_reflection(self, metadata, connection):
+    def test_enum_type_reflection(self, metadata, connection):
         etype = Enum(
             "four", "five", "six", name="fourfivesixtype", metadata=metadata
         )
@@ -1007,7 +1159,7 @@ class NamedTypeTest(
                 "one",
                 "two",
                 "three",
-                native_enum=True  # make sure this is True because
+                native_enum=True,  # make sure this is True because
                 # it should *not* take effect due to
                 # the variant
             ).with_variant(
@@ -1077,6 +1229,213 @@ class NamedTypeTest(
         assert "my_enum" not in [
             e["name"] for e in inspect(connection).get_enums()
         ]
+
+
+class DomainTest(
+    AssertsCompiledSQL, fixtures.TestBase, AssertsExecutionResults
+):
+    __backend__ = True
+    __only_on__ = "postgresql > 8.3"
+
+    @testing.requires.postgresql_working_nullable_domains
+    def test_domain_type_reflection(self, metadata, connection):
+        positive_int = DOMAIN(
+            "positive_int", Integer(), check="value > 0", not_null=True
+        )
+        my_str = DOMAIN("my_string", Text(), collation="C", default="~~")
+        Table(
+            "table",
+            metadata,
+            Column("value", positive_int),
+            Column("str", my_str),
+        )
+
+        metadata.create_all(connection)
+        m2 = MetaData()
+        t2 = Table("table", m2, autoload_with=connection)
+
+        vt = t2.c.value.type
+        is_true(isinstance(vt, DOMAIN))
+        is_true(isinstance(vt.data_type, Integer))
+        eq_(vt.name, "positive_int")
+        eq_(str(vt.check), "VALUE > 0")
+        is_(vt.default, None)
+        is_(vt.collation, None)
+        is_true(vt.constraint_name is not None)
+        is_true(vt.not_null)
+        is_false(vt.create_type)
+
+        st = t2.c.str.type
+        is_true(isinstance(st, DOMAIN))
+        is_true(isinstance(st.data_type, Text))
+        eq_(st.name, "my_string")
+        is_(st.check, None)
+        is_true("~~" in st.default)
+        eq_(st.collation, "C")
+        is_(st.constraint_name, None)
+        is_false(st.not_null)
+        is_false(st.create_type)
+
+    def test_domain_create_table(self, metadata, connection):
+        metadata = self.metadata
+        Email = DOMAIN(
+            name="email",
+            data_type=Text,
+            check=r"VALUE ~ '[^@]+@[^@]+\.[^@]+'",
+        )
+        PosInt = DOMAIN(
+            name="pos_int",
+            data_type=Integer,
+            not_null=True,
+            check=r"VALUE > 0",
+        )
+        t1 = Table(
+            "table",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("email", Email),
+            Column("number", PosInt),
+        )
+        t1.create(connection)
+        t1.create(connection, checkfirst=True)  # check the create
+        connection.execute(
+            t1.insert(), {"email": "test@example.com", "number": 42}
+        )
+        connection.execute(t1.insert(), {"email": "a@b.c", "number": 1})
+        connection.execute(
+            t1.insert(), {"email": "example@gmail.co.uk", "number": 99}
+        )
+        eq_(
+            connection.execute(t1.select().order_by(t1.c.id)).fetchall(),
+            [
+                (1, "test@example.com", 42),
+                (2, "a@b.c", 1),
+                (3, "example@gmail.co.uk", 99),
+            ],
+        )
+
+    @testing.combinations(
+        tuple(
+            [
+                DOMAIN(
+                    name="mytype",
+                    data_type=Text,
+                    check=r"VALUE ~ '[^@]+@[^@]+\.[^@]+'",
+                    create_type=True,
+                ),
+            ]
+        ),
+        tuple(
+            [
+                DOMAIN(
+                    name="mytype",
+                    data_type=Text,
+                    check=r"VALUE ~ '[^@]+@[^@]+\.[^@]+'",
+                    create_type=False,
+                ),
+            ]
+        ),
+        argnames="domain",
+    )
+    def test_create_drop_domain_with_table(self, connection, metadata, domain):
+        table = Table("e1", metadata, Column("e1", domain))
+
+        def _domain_names():
+            return {d["name"] for d in inspect(connection).get_domains()}
+
+        assert "mytype" not in _domain_names()
+
+        if domain.create_type:
+            table.create(connection)
+            assert "mytype" in _domain_names()
+        else:
+            with expect_raises(exc.ProgrammingError):
+                table.create(connection)
+            connection.rollback()
+
+            domain.create(connection)
+            assert "mytype" in _domain_names()
+            table.create(connection)
+
+        table.drop(connection)
+        if domain.create_type:
+            assert "mytype" not in _domain_names()
+
+    @testing.combinations(
+        (Integer, "value > 0", 4),
+        (String, "value != ''", "hello world"),
+        (
+            UUID,
+            "value != '{00000000-0000-0000-0000-000000000000}'",
+            uuid.uuid4(),
+        ),
+        (
+            DateTime,
+            "value >= '2020-01-01T00:00:00'",
+            datetime.datetime.fromisoformat("2021-01-01T00:00:00.000"),
+        ),
+        argnames="domain_datatype, domain_check, value",
+    )
+    def test_domain_roundtrip(
+        self, metadata, connection, domain_datatype, domain_check, value
+    ):
+        table = Table(
+            "domain_roundtrip_test",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column(
+                "value",
+                DOMAIN("valuedomain", domain_datatype, check=domain_check),
+            ),
+        )
+        table.create(connection)
+
+        connection.execute(table.insert(), {"value": value})
+
+        results = connection.execute(
+            table.select().order_by(table.c.id)
+        ).fetchall()
+        eq_(results, [(1, value)])
+
+    @testing.combinations(
+        (DOMAIN("pos_int", Integer, check="VALUE > 0", not_null=True), 4, -4),
+        (
+            DOMAIN("email", String, check=r"VALUE ~ '[^@]+@[^@]+\.[^@]+'"),
+            "e@xample.com",
+            "fred",
+        ),
+        argnames="domain,pass_value,fail_value",
+    )
+    def test_check_constraint(
+        self, metadata, connection, domain, pass_value, fail_value
+    ):
+        table = Table("table", metadata, Column("value", domain))
+        table.create(connection)
+
+        connection.execute(table.insert(), {"value": pass_value})
+
+        # psycopg/psycopg2 raise IntegrityError, while pg8000 raises
+        # ProgrammingError
+        with expect_raises(exc.DatabaseError):
+            connection.execute(table.insert(), {"value": fail_value})
+
+    @testing.combinations(
+        (DOMAIN("nullable_domain", Integer, not_null=True), 1),
+        (DOMAIN("non_nullable_domain", Integer, not_null=False), 1),
+        argnames="domain,pass_value",
+    )
+    def test_domain_nullable(self, metadata, connection, domain, pass_value):
+        table = Table("table", metadata, Column("value", domain))
+        table.create(connection)
+        connection.execute(table.insert(), {"value": pass_value})
+
+        if domain.not_null:
+            # psycopg/psycopg2 raise IntegrityError, while pg8000 raises
+            # ProgrammingError
+            with expect_raises(exc.DatabaseError):
+                connection.execute(table.insert(), {"value": None})
+        else:
+            connection.execute(table.insert(), {"value": None})
 
 
 class DomainDDLEventTest(DDLEventWCreateHarness, fixtures.TestBase):
@@ -1225,13 +1584,6 @@ class NumericInterpretationTest(fixtures.TestBase):
     __backend__ = True
 
     def test_numeric_codes(self):
-        from sqlalchemy.dialects.postgresql import (
-            base,
-            pg8000,
-            psycopg2,
-            psycopg2cffi,
-        )
-
         dialects = (
             pg8000.dialect(),
             psycopg2.dialect(),
@@ -1348,7 +1700,6 @@ class TimezoneTest(fixtures.TablesTest):
         assert row[0] >= somedate
 
     def test_without_timezone(self, connection):
-
         # get a date without a tzinfo
         tztable, notztable = self.tables("tztable", "notztable")
 
@@ -1398,7 +1749,6 @@ class TimePrecisionCompileTest(fixtures.TestBase, AssertsCompiledSQL):
 
 
 class TimePrecisionTest(fixtures.TestBase):
-
     __only_on__ = "postgresql"
     __backend__ = True
 
@@ -1416,6 +1766,10 @@ class TimePrecisionTest(fixtures.TestBase):
         t1.create(connection)
         m2 = MetaData()
         t2 = Table("t1", m2, autoload_with=connection)
+
+        eq_(t1.c.c1.type.__class__, postgresql.TIME)
+        eq_(t1.c.c4.type.__class__, postgresql.TIMESTAMP)
+
         eq_(t2.c.c1.type.precision, None)
         eq_(t2.c.c2.type.precision, 5)
         eq_(t2.c.c3.type.precision, 5)
@@ -1628,6 +1982,24 @@ class ArrayTest(AssertsCompiledSQL, fixtures.TestBase):
             checkparams={"param_1": 4, "param_3": 6, "param_2": 5},
         )
 
+    def test_array_overlap_any(self):
+        col = column("x", postgresql.ARRAY(Integer))
+        self.assert_compile(
+            select(col.overlap(any_(array([4, 5, 6])))),
+            "SELECT x && ANY (ARRAY[%(param_1)s, %(param_2)s, %(param_3)s]) "
+            "AS anon_1",
+            checkparams={"param_1": 4, "param_3": 6, "param_2": 5},
+        )
+
+    def test_array_contains_any(self):
+        col = column("x", postgresql.ARRAY(Integer))
+        self.assert_compile(
+            select(col.contains(any_(array([4, 5, 6])))),
+            "SELECT x @> ANY (ARRAY[%(param_1)s, %(param_2)s, %(param_3)s]) "
+            "AS anon_1",
+            checkparams={"param_1": 4, "param_3": 6, "param_2": 5},
+        )
+
     def test_array_slice_index(self):
         col = column("x", postgresql.ARRAY(Integer))
         self.assert_compile(
@@ -1735,12 +2107,6 @@ class ArrayTest(AssertsCompiledSQL, fixtures.TestBase):
         argnames="with_enum, using_aggregate_order_by",
     )
     def test_array_agg_specific(self, with_enum, using_aggregate_order_by):
-        from sqlalchemy.dialects.postgresql import (
-            ENUM,
-            aggregate_order_by,
-            array_agg,
-        )
-
         element = ENUM(name="pgenum") if with_enum else Integer()
         element_type = type(element)
         expr = (
@@ -1763,7 +2129,6 @@ AnEnum("Baz", 3)
 
 
 class ArrayRoundTripTest:
-
     __only_on__ = "postgresql"
     __backend__ = True
 
@@ -2199,7 +2564,6 @@ class ArrayRoundTripTest:
         )
 
     def test_tuple_flag(self, connection, metadata):
-
         t1 = Table(
             "t1",
             metadata,
@@ -2586,7 +2950,6 @@ class ArrayRoundTripTest:
 class CoreArrayRoundTripTest(
     ArrayRoundTripTest, fixtures.TablesTest, AssertsExecutionResults
 ):
-
     ARRAY = sqltypes.ARRAY
 
 
@@ -3004,7 +3367,9 @@ class HashableFlagORMTest(fixtures.TestBase):
         )
 
 
-class TimestampTest(fixtures.TestBase, AssertsExecutionResults):
+class TimestampTest(
+    fixtures.TestBase, AssertsCompiledSQL, AssertsExecutionResults
+):
     __only_on__ = "postgresql"
     __backend__ = True
 
@@ -3034,6 +3399,41 @@ class TimestampTest(fixtures.TestBase, AssertsExecutionResults):
         expr = column("bar", postgresql.INTERVAL) == datetime.timedelta(days=1)
         eq_(expr.right.type._type_affinity, types.Interval)
 
+    def test_interval_literal_processor(self, connection):
+        stmt = text("select :parameter - :parameter2")
+        result = connection.execute(
+            stmt.bindparams(
+                bindparam(
+                    "parameter",
+                    datetime.timedelta(days=1, minutes=3, seconds=4),
+                    literal_execute=True,
+                ),
+                bindparam(
+                    "parameter2",
+                    datetime.timedelta(days=0, minutes=1, seconds=4),
+                    literal_execute=True,
+                ),
+            )
+        ).one()
+        eq_(result[0], datetime.timedelta(days=1, seconds=120))
+
+    @testing.combinations(
+        (
+            text("select :parameter").bindparams(
+                parameter=datetime.timedelta(days=2)
+            ),
+            ("select make_interval(secs=>172800.0)"),
+        ),
+        (
+            text("select :parameter").bindparams(
+                parameter=datetime.timedelta(days=730, seconds=2323213392),
+            ),
+            ("select make_interval(secs=>2386285392.0)"),
+        ),
+    )
+    def test_interval_literal_processor_compiled(self, type_, expected):
+        self.assert_compile(type_, expected, literal_binds=True)
+
 
 class SpecialTypesCompileTest(fixtures.TestBase, AssertsCompiledSQL):
     __dialect__ = "postgresql"
@@ -3049,7 +3449,6 @@ class SpecialTypesCompileTest(fixtures.TestBase, AssertsCompiledSQL):
 
 
 class SpecialTypesTest(fixtures.TablesTest, ComparesTables):
-
     """test DDL and reflection of PG-specific types"""
 
     __only_on__ = ("postgresql >= 8.3.0",)
@@ -3057,7 +3456,6 @@ class SpecialTypesTest(fixtures.TablesTest, ComparesTables):
 
     @testing.metadata_fixture()
     def special_types_table(self, metadata):
-
         # create these types so that we can issue
         # special SQL92 INTERVAL syntax
         class y2m(types.UserDefinedType, postgresql.INTERVAL):
@@ -3141,7 +3539,6 @@ class SpecialTypesTest(fixtures.TablesTest, ComparesTables):
 
 
 class UUIDTest(fixtures.TestBase):
-
     """Test postgresql-specific UUID cases.
 
     See also generic UUID tests in testing/suite/test_types
@@ -3247,7 +3644,6 @@ class HStoreTest(AssertsCompiledSQL, fixtures.TestBase):
         )
 
     def test_bind_serialize_default(self):
-
         dialect = postgresql.dialect(use_native_hstore=False)
         proc = self.test_table.c.hash.type._cached_bind_processor(dialect)
         eq_(
@@ -3342,8 +3738,7 @@ class HStoreTest(AssertsCompiledSQL, fixtures.TestBase):
 
     def test_where_has_key(self):
         self._test_where(
-            # hide from 2to3
-            getattr(self.hashcol, "has_key")("foo"),
+            self.hashcol.has_key("foo"),
             "test_table.hash ? %(hash_1)s",
         )
 
@@ -3377,10 +3772,46 @@ class HStoreTest(AssertsCompiledSQL, fixtures.TestBase):
             "test_table.hash <@ %(hash_1)s",
         )
 
+    def test_where_has_key_any(self):
+        self._test_where(
+            self.hashcol.has_key(any_(array(["foo"]))),
+            "test_table.hash ? ANY (ARRAY[%(param_1)s])",
+        )
+
+    def test_where_has_all_any(self):
+        self._test_where(
+            self.hashcol.has_all(any_(postgresql.array(["1", "2"]))),
+            "test_table.hash ?& ANY (ARRAY[%(param_1)s, %(param_2)s])",
+        )
+
+    def test_where_has_any_any(self):
+        self._test_where(
+            self.hashcol.has_any(any_(postgresql.array(["1", "2"]))),
+            "test_table.hash ?| ANY (ARRAY[%(param_1)s, %(param_2)s])",
+        )
+
+    def test_where_contains_any(self):
+        self._test_where(
+            self.hashcol.contains(any_(array(["foo"]))),
+            "test_table.hash @> ANY (ARRAY[%(param_1)s])",
+        )
+
+    def test_where_contained_by_any(self):
+        self._test_where(
+            self.hashcol.contained_by(any_(array(["foo"]))),
+            "test_table.hash <@ ANY (ARRAY[%(param_1)s])",
+        )
+
     def test_where_getitem(self):
         self._test_where(
             self.hashcol["bar"] == None,  # noqa
             "(test_table.hash -> %(hash_1)s) IS NULL",
+        )
+
+    def test_where_getitem_any(self):
+        self._test_where(
+            self.hashcol["bar"] == any_(array(["foo"])),  # noqa
+            "(test_table.hash -> %(hash_1)s) = ANY (ARRAY[%(param_1)s])",
         )
 
     @testing.combinations(
@@ -3671,6 +4102,53 @@ class HStoreRoundTripTest(fixtures.TablesTest):
             eq_(s.query(Data.data, Data).all(), [(d.data, d)])
 
 
+class RangeMiscTests(fixtures.TestBase):
+    @testing.combinations(
+        (Range(2, 7), INT4RANGE),
+        (Range(-10, 7), INT4RANGE),
+        (Range(None, -7), INT4RANGE),
+        (Range(33, None), INT4RANGE),
+        (Range(-2147483648, 2147483647), INT4RANGE),
+        (Range(-2147483648 - 1, 2147483647), INT8RANGE),
+        (Range(-2147483648, 2147483647 + 1), INT8RANGE),
+        (Range(-2147483648 - 1, None), INT8RANGE),
+        (Range(None, 2147483647 + 1), INT8RANGE),
+    )
+    def test_resolve_for_literal(self, obj, type_):
+        """This tests that the int4 / int8 version is selected correctly by
+        _resolve_for_literal."""
+        lit = literal(obj)
+        eq_(type(lit.type), type_)
+
+    @testing.combinations(
+        (Range(2, 7), INT4MULTIRANGE),
+        (Range(-10, 7), INT4MULTIRANGE),
+        (Range(None, -7), INT4MULTIRANGE),
+        (Range(33, None), INT4MULTIRANGE),
+        (Range(-2147483648, 2147483647), INT4MULTIRANGE),
+        (Range(-2147483648 - 1, 2147483647), INT8MULTIRANGE),
+        (Range(-2147483648, 2147483647 + 1), INT8MULTIRANGE),
+        (Range(-2147483648 - 1, None), INT8MULTIRANGE),
+        (Range(None, 2147483647 + 1), INT8MULTIRANGE),
+    )
+    def test_resolve_for_literal_multi(self, obj, type_):
+        """This tests that the int4 / int8 version is selected correctly by
+        _resolve_for_literal."""
+        list_ = MultiRange([Range(-1, 1), obj, Range(7, 100)])
+        lit = literal(list_)
+        eq_(type(lit.type), type_)
+
+    def test_multirange_sequence(self):
+        plain = [Range(-1, 1), Range(42, 43), Range(7, 100)]
+        mr = MultiRange(plain)
+        is_true(issubclass(MultiRange, list))
+        is_true(isinstance(mr, list))
+        eq_(mr, plain)
+        eq_(str(mr), str(plain))
+        eq_(repr(mr), repr(plain))
+        ne_(mr, plain[1:])
+
+
 class _RangeTests:
     _col_type = None
     "The concrete range class these tests are for."
@@ -3695,6 +4173,10 @@ class _RangeTypeCompilation(
 ):
     __dialect__ = "postgresql"
 
+    @property
+    def _col_str_arr(self):
+        return self._col_str
+
     # operator tests
 
     @classmethod
@@ -3710,32 +4192,72 @@ class _RangeTypeCompilation(
         self.assert_compile(colclause, expected)
         is_(colclause.type._type_affinity, type_._type_affinity)
 
-    def test_where_equal(self):
+    _comparisons = [
+        (lambda col, other: col == other, "="),
+        (lambda col, other: col != other, "!="),
+        (lambda col, other: col > other, ">"),
+        (lambda col, other: col < other, "<"),
+        (lambda col, other: col >= other, ">="),
+        (lambda col, other: col <= other, "<="),
+        (lambda col, other: col.contains(other), "@>"),
+        (lambda col, other: col.contained_by(other), "<@"),
+        (lambda col, other: col.overlaps(other), "&&"),
+        (lambda col, other: col << other, "<<"),
+        (lambda col, other: col.strictly_left_of(other), "<<"),
+        (lambda col, other: col >> other, ">>"),
+        (lambda col, other: col.strictly_right_of(other), ">>"),
+        (lambda col, other: col.not_extend_left_of(other), "&>"),
+        (lambda col, other: col.not_extend_right_of(other), "&<"),
+        (lambda col, other: col.adjacent_to(other), "-|-"),
+    ]
+
+    _operations = [
+        (lambda col, other: col + other, "+"),
+        (lambda col, other: col.union(other), "+"),
+        (lambda col, other: col - other, "-"),
+        (lambda col, other: col.difference(other), "-"),
+        (lambda col, other: col * other, "*"),
+        (lambda col, other: col.intersection(other), "*"),
+    ]
+
+    _all_fns = _comparisons + _operations
+
+    _not_compare_op = ("+", "-", "*")
+
+    @testing.combinations(*_all_fns, id_="as")
+    def test_data_str(self, fn, op):
         self._test_clause(
-            self.col == self._data_str(),
-            "data_table.range = %(range_1)s",
-            sqltypes.BOOLEANTYPE,
+            fn(self.col, self._data_str()),
+            f"data_table.range {op} %(range_1)s",
+            (
+                self.col.type
+                if op in self._not_compare_op
+                else sqltypes.BOOLEANTYPE
+            ),
         )
 
-    def test_where_equal_obj(self):
+    @testing.combinations(*_all_fns, id_="as")
+    def test_data_obj(self, fn, op):
         self._test_clause(
-            self.col == self._data_obj(),
-            f"data_table.range = %(range_1)s::{self._col_str}",
-            sqltypes.BOOLEANTYPE,
+            fn(self.col, self._data_obj()),
+            f"data_table.range {op} %(range_1)s::{self._col_str}",
+            (
+                self.col.type
+                if op in self._not_compare_op
+                else sqltypes.BOOLEANTYPE
+            ),
         )
 
-    def test_where_not_equal(self):
+    @testing.combinations(*_comparisons, id_="as")
+    def test_data_str_any(self, fn, op):
         self._test_clause(
-            self.col != self._data_str(),
-            "data_table.range <> %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_where_not_equal_obj(self):
-        self._test_clause(
-            self.col != self._data_obj(),
-            f"data_table.range <> %(range_1)s::{self._col_str}",
-            sqltypes.BOOLEANTYPE,
+            fn(self.col, any_(array([self._data_str()]))),
+            f"data_table.range {op} ANY (ARRAY[%(param_1)s])",
+            (
+                self.col.type
+                if op in self._not_compare_op
+                else sqltypes.BOOLEANTYPE
+            ),
         )
 
     def test_where_is_null(self):
@@ -3748,140 +4270,6 @@ class _RangeTypeCompilation(
             self.col != None,
             "data_table.range IS NOT NULL",
             sqltypes.BOOLEANTYPE,
-        )
-
-    def test_where_less_than(self):
-        self._test_clause(
-            self.col < self._data_str(),
-            "data_table.range < %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_where_greater_than(self):
-        self._test_clause(
-            self.col > self._data_str(),
-            "data_table.range > %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_where_less_than_or_equal(self):
-        self._test_clause(
-            self.col <= self._data_str(),
-            "data_table.range <= %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_where_greater_than_or_equal(self):
-        self._test_clause(
-            self.col >= self._data_str(),
-            "data_table.range >= %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_contains(self):
-        self._test_clause(
-            self.col.contains(self._data_str()),
-            "data_table.range @> %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_contains_obj(self):
-        self._test_clause(
-            self.col.contains(self._data_obj()),
-            f"data_table.range @> %(range_1)s::{self._col_str}",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_contained_by(self):
-        self._test_clause(
-            self.col.contained_by(self._data_str()),
-            "data_table.range <@ %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_overlaps(self):
-        self._test_clause(
-            self.col.overlaps(self._data_str()),
-            "data_table.range && %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_strictly_left_of(self):
-        self._test_clause(
-            self.col << self._data_str(),
-            "data_table.range << %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-        self._test_clause(
-            self.col.strictly_left_of(self._data_str()),
-            "data_table.range << %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_strictly_right_of(self):
-        self._test_clause(
-            self.col >> self._data_str(),
-            "data_table.range >> %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-        self._test_clause(
-            self.col.strictly_right_of(self._data_str()),
-            "data_table.range >> %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_not_extend_right_of(self):
-        self._test_clause(
-            self.col.not_extend_right_of(self._data_str()),
-            "data_table.range &< %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_not_extend_left_of(self):
-        self._test_clause(
-            self.col.not_extend_left_of(self._data_str()),
-            "data_table.range &> %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_adjacent_to(self):
-        self._test_clause(
-            self.col.adjacent_to(self._data_str()),
-            "data_table.range -|- %(range_1)s",
-            sqltypes.BOOLEANTYPE,
-        )
-
-    def test_union(self):
-        self._test_clause(
-            self.col + self.col,
-            "data_table.range + data_table.range",
-            self.col.type,
-        )
-
-        self._test_clause(
-            self.col.union(self._data_str()),
-            "data_table.range + %(range_1)s",
-            self.col.type,
-        )
-
-    def test_intersection(self):
-        self._test_clause(
-            self.col * self.col,
-            "data_table.range * data_table.range",
-            self.col.type,
-        )
-
-    def test_difference(self):
-        self._test_clause(
-            self.col - self.col,
-            "data_table.range - data_table.range",
-            self.col.type,
-        )
-
-        self._test_clause(
-            self.col.difference(self._data_str()),
-            "data_table.range - %(range_1)s",
-            self.col.type,
         )
 
 
@@ -3990,12 +4378,14 @@ class _RangeComparisonFixtures(_RangeTests):
         )
 
         is_true(range_.contains(values["il"]))
+        is_true(values["il"] in range_)
 
         is_false(
             range_.contains(Range(lower=values["ll"], upper=values["ih"]))
         )
 
         is_false(range_.contains(values["rh"]))
+        is_false(values["rh"] in range_)
 
         is_true(range_ == range_)
         is_false(range_ != range_)
@@ -4043,6 +4433,7 @@ class _RangeComparisonFixtures(_RangeTests):
         )
         r, expected = connection.execute(q).first()
         eq_(r.contains(v), expected)
+        eq_(v in r, expected)
 
     _common_ranges_to_test = (
         lambda r, e: Range(empty=True),
@@ -4103,6 +4494,12 @@ class _RangeComparisonFixtures(_RangeTests):
             f"{r1}.contains({r2}): got {py_contains},"
             f" expected {pg_contains}",
         )
+        r2_in_r1 = r2 in r1
+        eq_(
+            r2_in_r1,
+            pg_contains,
+            f"{r2} in {r1}: got {r2_in_r1}, expected {pg_contains}",
+        )
         py_contained = r1.contained_by(r2)
         eq_(
             py_contained,
@@ -4115,6 +4512,12 @@ class _RangeComparisonFixtures(_RangeTests):
             pg_contained,
             f"{r2}.contains({r1}: got {r2.contains(r1)},"
             f" expected {pg_contained})",
+        )
+        r1_in_r2 = r1 in r2
+        eq_(
+            r1_in_r2,
+            pg_contained,
+            f"{r1} in {r2}: got {r1_in_r2}, expected {pg_contained}",
         )
 
     @testing.combinations(
@@ -4401,6 +4804,50 @@ class _RangeComparisonFixtures(_RangeTests):
     @testing.combinations(
         *_common_ranges_to_test,
         lambda r, e: Range(r.lower, r.lower, bounds="[]"),
+        lambda r, e: Range(r.lower - e, r.upper - e, bounds="[]"),
+        lambda r, e: Range(r.lower - e, r.upper + e, bounds="[)"),
+        lambda r, e: Range(r.lower - e, r.upper + e, bounds="[]"),
+        argnames="r1t",
+    )
+    @testing.combinations(
+        *_common_ranges_to_test,
+        lambda r, e: Range(r.lower, r.lower, bounds="[]"),
+        lambda r, e: Range(r.lower, r.upper - e, bounds="(]"),
+        lambda r, e: Range(r.lower, r.lower + e, bounds="[)"),
+        lambda r, e: Range(r.lower - e, r.lower, bounds="(]"),
+        lambda r, e: Range(r.lower - e, r.lower + e, bounds="()"),
+        lambda r, e: Range(r.lower, r.upper, bounds="[]"),
+        lambda r, e: Range(r.lower, r.upper, bounds="()"),
+        argnames="r2t",
+    )
+    def test_intersection(self, connection, r1t, r2t):
+        r1 = r1t(self._data_obj(), self._epsilon)
+        r2 = r2t(self._data_obj(), self._epsilon)
+
+        RANGE = self._col_type
+        range_typ = self._col_str
+
+        q = select(
+            cast(r1, RANGE).intersection(r2),
+        )
+        validate_q = select(
+            literal_column(f"'{r1}'::{range_typ}*'{r2}'::{range_typ}", RANGE),
+        )
+
+        pg_res = connection.execute(q).scalar()
+
+        validate_intersection = connection.execute(validate_q).scalar()
+        eq_(pg_res, validate_intersection)
+        py_res = r1.intersection(r2)
+        eq_(
+            py_res,
+            pg_res,
+            f"{r1}.intersection({r2}): got {py_res}, expected {pg_res}",
+        )
+
+    @testing.combinations(
+        *_common_ranges_to_test,
+        lambda r, e: Range(r.lower, r.lower, bounds="[]"),
         argnames="r1t",
     )
     @testing.combinations(
@@ -4471,10 +4918,20 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
         Brought up in #8540.
 
         """
+        # see also CompileTest::test_range_custom_object_hook
         data_obj = self._data_obj()
         stmt = select(literal(data_obj, type_=self._col_type))
         round_trip = connection.scalar(stmt)
         eq_(round_trip, data_obj)
+
+    def test_auto_cast_back_to_type_without_type(self, connection):
+        """use _resolve_for_literal to cast"""
+        # see also CompileTest::test_range_custom_object_hook
+        data_obj = self._data_obj()
+        lit = literal(data_obj)
+        round_trip = connection.scalar(select(lit))
+        eq_(round_trip, data_obj)
+        eq_(type(lit.type), self._col_type)
 
     def test_actual_type(self):
         eq_(str(self._col_type()), self._col_str)
@@ -4532,7 +4989,7 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
         )
         self._assert_data(connection)
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_insert_text(self, connection):
         connection.execute(
             self.tables.data_table.insert(), {"range": self._data_str()}
@@ -4549,7 +5006,7 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
         data = connection.execute(select(range_ + range_)).fetchall()
         eq_(data, [(self._data_obj(),)])
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_union_result_text(self, connection):
         # insert
         connection.execute(
@@ -4570,7 +5027,7 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
         data = connection.execute(select(range_ * range_)).fetchall()
         eq_(data, [(self._data_obj(),)])
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_intersection_result_text(self, connection):
         # insert
         connection.execute(
@@ -4591,7 +5048,7 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
         data = connection.execute(select(range_ - range_)).fetchall()
         eq_(data, [(self._data_obj().__class__(empty=True),)])
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_difference_result_text(self, connection):
         # insert
         connection.execute(
@@ -4604,9 +5061,9 @@ class _RangeTypeRoundTrip(_RangeComparisonFixtures, fixtures.TablesTest):
 
 
 class _Int4RangeTests:
-
     _col_type = INT4RANGE
     _col_str = "INT4RANGE"
+    _col_str_arr = "INT8RANGE"
 
     def _data_str(self):
         return "[1,4)"
@@ -4624,7 +5081,6 @@ class _Int4RangeTests:
 
 
 class _Int8RangeTests:
-
     _col_type = INT8RANGE
     _col_str = "INT8RANGE"
 
@@ -4644,7 +5100,6 @@ class _Int8RangeTests:
 
 
 class _NumRangeTests:
-
     _col_type = NUMRANGE
     _col_str = "NUMRANGE"
 
@@ -4664,7 +5119,6 @@ class _NumRangeTests:
 
 
 class _DateRangeTests:
-
     _col_type = DATERANGE
     _col_str = "DATERANGE"
 
@@ -4684,7 +5138,6 @@ class _DateRangeTests:
 
 
 class _DateTimeRangeTests:
-
     _col_type = TSRANGE
     _col_str = "TSRANGE"
 
@@ -4707,7 +5160,6 @@ class _DateTimeRangeTests:
 
 
 class _DateTimeTZRangeTests:
-
     _col_type = TSTZRANGE
     _col_str = "TSTZRANGE"
 
@@ -4820,14 +5272,14 @@ class _MultiRangeTypeCompilation(AssertsCompiledSQL, fixtures.TestBase):
     def test_where_not_equal(self):
         self._test_clause(
             self.col != self._data_str(),
-            "data_table.multirange <> %(multirange_1)s",
+            "data_table.multirange != %(multirange_1)s",
             sqltypes.BOOLEANTYPE,
         )
 
     def test_where_not_equal_obj(self):
         self._test_clause(
             self.col != self._data_obj(),
-            f"data_table.multirange <> %(multirange_1)s::{self._col_str}",
+            f"data_table.multirange != %(multirange_1)s::{self._col_str}",
             sqltypes.BOOLEANTYPE,
         )
 
@@ -4975,9 +5427,16 @@ class _MultiRangeTypeCompilation(AssertsCompiledSQL, fixtures.TestBase):
         )
 
 
-class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
+class _MultiRangeTypeRoundTrip(fixtures.TablesTest, _RangeTests):
     __requires__ = ("multirange_types",)
     __backend__ = True
+
+    @testing.fixture(params=(True, False), ids=["multirange", "plain_list"])
+    def data_obj(self, request):
+        if request.param:
+            return MultiRange(self._data_obj())
+        else:
+            return list(self._data_obj())
 
     @classmethod
     def define_tables(cls, metadata):
@@ -4990,7 +5449,7 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
         )
         cls.col = table.c.range
 
-    def test_auto_cast_back_to_type(self, connection):
+    def test_auto_cast_back_to_type(self, connection, data_obj):
         """test that a straight pass of the range type without any context
         will send appropriate casting info so that the driver can round
         trip it.
@@ -5005,10 +5464,28 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
         Brought up in #8540.
 
         """
-        data_obj = self._data_obj()
+        # see also CompileTest::test_multirange_custom_object_hook
         stmt = select(literal(data_obj, type_=self._col_type))
         round_trip = connection.scalar(stmt)
         eq_(round_trip, data_obj)
+
+    def test_auto_cast_back_to_type_without_type(self, connection):
+        """use _resolve_for_literal to cast"""
+        # see also CompileTest::test_multirange_custom_object_hook
+        data_obj = MultiRange(self._data_obj())
+        lit = literal(data_obj)
+        round_trip = connection.scalar(select(lit))
+        eq_(round_trip, data_obj)
+        eq_(type(lit.type), self._col_type)
+
+    @testing.fails("no automatic adaptation of plain list")
+    def test_auto_cast_back_to_type_without_type_plain_list(self, connection):
+        """use _resolve_for_literal to cast"""
+        # see also CompileTest::test_multirange_custom_object_hook
+        data_obj = list(self._data_obj())
+        lit = literal(data_obj)
+        r = connection.scalar(select(lit))
+        eq_(type(r), list)
 
     def test_actual_type(self):
         eq_(str(self._col_type()), self._col_str)
@@ -5023,12 +5500,12 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
     def _assert_data(self, conn):
         data = conn.execute(select(self.tables.data_table.c.range)).fetchall()
         eq_(data, [(self._data_obj(),)])
+        eq_(type(data[0][0]), MultiRange)
 
-    def test_textual_round_trip_w_dialect_type(self, connection):
+    def test_textual_round_trip_w_dialect_type(self, connection, data_obj):
         """test #8690"""
         data_table = self.tables.data_table
 
-        data_obj = self._data_obj()
         connection.execute(
             self.tables.data_table.insert(), {"range": data_obj}
         )
@@ -5041,20 +5518,20 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
 
         eq_(data_obj, v2)
 
-    def test_insert_obj(self, connection):
+    def test_insert_obj(self, connection, data_obj):
         connection.execute(
-            self.tables.data_table.insert(), {"range": self._data_obj()}
+            self.tables.data_table.insert(), {"range": data_obj}
         )
         self._assert_data(connection)
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_insert_text(self, connection):
         connection.execute(
             self.tables.data_table.insert(), {"range": self._data_str()}
         )
         self._assert_data(connection)
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_union_result_text(self, connection):
         # insert
         connection.execute(
@@ -5064,8 +5541,9 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
         range_ = self.tables.data_table.c.range
         data = connection.execute(select(range_ + range_)).fetchall()
         eq_(data, [(self._data_obj(),)])
+        eq_(type(data[0][0]), MultiRange)
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_intersection_result_text(self, connection):
         # insert
         connection.execute(
@@ -5075,8 +5553,9 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
         range_ = self.tables.data_table.c.range
         data = connection.execute(select(range_ * range_)).fetchall()
         eq_(data, [(self._data_obj(),)])
+        eq_(type(data[0][0]), MultiRange)
 
-    @testing.requires.any_psycopg_compatibility
+    @testing.requires.psycopg_or_pg8000_compatibility
     def test_difference_result_text(self, connection):
         # insert
         connection.execute(
@@ -5086,10 +5565,10 @@ class _MultiRangeTypeRoundTrip(fixtures.TablesTest):
         range_ = self.tables.data_table.c.range
         data = connection.execute(select(range_ - range_)).fetchall()
         eq_(data, [([],)])
+        eq_(type(data[0][0]), MultiRange)
 
 
 class _Int4MultiRangeTests:
-
     _col_type = INT4MULTIRANGE
     _col_str = "INT4MULTIRANGE"
 
@@ -5097,15 +5576,10 @@ class _Int4MultiRangeTests:
         return "{[1,2), [3, 5), [9, 12)}"
 
     def _data_obj(self):
-        return [
-            Range(1, 2),
-            Range(3, 5),
-            Range(9, 12),
-        ]
+        return [Range(1, 2), Range(3, 5), Range(9, 12)]
 
 
 class _Int8MultiRangeTests:
-
     _col_type = INT8MULTIRANGE
     _col_str = "INT8MULTIRANGE"
 
@@ -5123,7 +5597,6 @@ class _Int8MultiRangeTests:
 
 
 class _NumMultiRangeTests:
-
     _col_type = NUMMULTIRANGE
     _col_str = "NUMMULTIRANGE"
 
@@ -5139,7 +5612,6 @@ class _NumMultiRangeTests:
 
 
 class _DateMultiRangeTests:
-
     _col_type = DATEMULTIRANGE
     _col_str = "DATEMULTIRANGE"
 
@@ -5154,7 +5626,6 @@ class _DateMultiRangeTests:
 
 
 class _DateTimeMultiRangeTests:
-
     _col_type = TSMULTIRANGE
     _col_str = "TSMULTIRANGE"
 
@@ -5178,9 +5649,10 @@ class _DateTimeMultiRangeTests:
 
 
 class _DateTimeTZMultiRangeTests:
-
     _col_type = TSTZMULTIRANGE
     _col_str = "TSTZMULTIRANGE"
+
+    __only_on__ = "postgresql"
 
     # make sure we use one, steady timestamp with timezone pair
     # for all parts of all these tests
@@ -5188,21 +5660,29 @@ class _DateTimeTZMultiRangeTests:
     _tstzs_delta = None
 
     def tstzs(self):
+        # note this was hitting DST issues when these tests were using a
+        # live date and running on or near 2024-03-09 :).   hardcoded to a
+        # date a few days earlier
+        utc_now = datetime.datetime(
+            2024, 3, 2, 14, 57, 50, 473566, tzinfo=datetime.timezone.utc
+        )
+
         if self._tstzs is None:
-            with testing.db.connect() as connection:
-                lower = connection.scalar(func.current_timestamp().select())
-                upper = lower + datetime.timedelta(1)
-                self._tstzs = (lower, upper)
+            lower = utc_now
+            upper = lower + datetime.timedelta(1)
+            self._tstzs = (lower, upper)
         return self._tstzs
 
     def tstzs_delta(self):
+        utc_now = datetime.datetime(
+            2024, 3, 2, 14, 57, 50, 473566, tzinfo=datetime.timezone.utc
+        )
+
         if self._tstzs_delta is None:
-            with testing.db.connect() as connection:
-                lower = connection.scalar(
-                    func.current_timestamp().select()
-                ) + datetime.timedelta(3)
-                upper = lower + datetime.timedelta(2)
-                self._tstzs_delta = (lower, upper)
+            lower = utc_now + datetime.timedelta(3)
+            upper = lower + datetime.timedelta(2)
+            self._tstzs_delta = (lower, upper)
+
         return self._tstzs_delta
 
     def _data_str(self):
@@ -5294,6 +5774,17 @@ class DateTimeTZRMultiangeRoundTripTest(
     pass
 
 
+class MultiRangeSequenceTest(fixtures.TestBase):
+    def test_methods(self):
+        plain = [Range(1, 3), Range(5, 9)]
+        multi = MultiRange(plain)
+        is_true(isinstance(multi, list))
+        eq_(multi, plain)
+        ne_(multi, plain[:1])
+        eq_(str(multi), str(plain))
+        eq_(repr(multi), repr(plain))
+
+
 class JSONTest(AssertsCompiledSQL, fixtures.TestBase):
     __dialect__ = "postgresql"
 
@@ -5307,14 +5798,26 @@ class JSONTest(AssertsCompiledSQL, fixtures.TestBase):
         )
         self.jsoncol = self.test_table.c.test_column
 
+    @property
+    def any_(self):
+        return any_(array([7]))
+
     @testing.combinations(
         (
             lambda self: self.jsoncol["bar"] == None,  # noqa
             "(test_table.test_column -> %(test_column_1)s) IS NULL",
         ),
         (
+            lambda self: self.jsoncol["bar"] != None,  # noqa
+            "(test_table.test_column -> %(test_column_1)s) IS NOT NULL",
+        ),
+        (
             lambda self: self.jsoncol[("foo", 1)] == None,  # noqa
             "(test_table.test_column #> %(test_column_1)s) IS NULL",
+        ),
+        (
+            lambda self: self.jsoncol[("foo", 1)] != None,  # noqa
+            "(test_table.test_column #> %(test_column_1)s) IS NOT NULL",
         ),
         (
             lambda self: self.jsoncol["bar"].astext == None,  # noqa
@@ -5334,6 +5837,45 @@ class JSONTest(AssertsCompiledSQL, fixtures.TestBase):
             lambda self: self.jsoncol[("foo", 1)].astext == None,  # noqa
             "(test_table.test_column #>> %(test_column_1)s) IS NULL",
         ),
+        (
+            lambda self: self.jsoncol["bar"] == 42,
+            "(test_table.test_column -> %(test_column_1)s) = %(param_1)s",
+        ),
+        (
+            lambda self: self.jsoncol["bar"] != 42,
+            "(test_table.test_column -> %(test_column_1)s) != %(param_1)s",
+        ),
+        (
+            lambda self: self.jsoncol["bar"] == self.any_,
+            "(test_table.test_column -> %(test_column_1)s) = "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        (
+            lambda self: self.jsoncol["bar"] != self.any_,
+            "(test_table.test_column -> %(test_column_1)s) != "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        (
+            lambda self: self.jsoncol["bar"].astext == self.any_,
+            "(test_table.test_column ->> %(test_column_1)s) = "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        (
+            lambda self: self.jsoncol["bar"].astext != self.any_,
+            "(test_table.test_column ->> %(test_column_1)s) != "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        (
+            lambda self: self.jsoncol[("foo", 1)] == self.any_,
+            "(test_table.test_column #> %(test_column_1)s) = "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        (
+            lambda self: self.jsoncol[("foo", 1)] != self.any_,
+            "(test_table.test_column #> %(test_column_1)s) != "
+            "ANY (ARRAY[%(param_1)s])",
+        ),
+        id_="as",
     )
     def test_where(self, whereclause_fn, expected):
         whereclause = whereclause_fn(self)
@@ -5401,7 +5943,6 @@ class JSONRoundTripTest(fixtures.TablesTest):
         return self.tables.data_table
 
     def _fixture_data(self, connection):
-
         data = [
             {"name": "r1", "data": {"k1": "r1v1", "k2": "r1v2"}},
             {"name": "r2", "data": {"k1": "r2v1", "k2": "r2v2"}},
@@ -5659,15 +6200,22 @@ class JSONBTest(JSONTest):
 
     @testing.combinations(
         (
-            # hide from 2to3
-            lambda self: getattr(self.jsoncol, "has_key")("data"),
+            lambda self: self.jsoncol.has_key("data"),
             "test_table.test_column ? %(test_column_1)s",
+        ),
+        (
+            lambda self: self.jsoncol.has_key(self.any_),
+            "test_table.test_column ? ANY (ARRAY[%(param_1)s])",
         ),
         (
             lambda self: self.jsoncol.has_all(
                 {"name": "r1", "data": {"k1": "r1v1", "k2": "r1v2"}}
             ),
-            "test_table.test_column ?& %(test_column_1)s",
+            "test_table.test_column ?& %(test_column_1)s::JSONB",
+        ),
+        (
+            lambda self: self.jsoncol.has_all(self.any_),
+            "test_table.test_column ?& ANY (ARRAY[%(param_1)s])",
         ),
         (
             lambda self: self.jsoncol.has_any(
@@ -5676,12 +6224,24 @@ class JSONBTest(JSONTest):
             "test_table.test_column ?| ARRAY[%(param_1)s, %(param_2)s]",
         ),
         (
+            lambda self: self.jsoncol.has_any(self.any_),
+            "test_table.test_column ?| ANY (ARRAY[%(param_1)s])",
+        ),
+        (
             lambda self: self.jsoncol.contains({"k1": "r1v1"}),
-            "test_table.test_column @> %(test_column_1)s",
+            "test_table.test_column @> %(test_column_1)s::JSONB",
+        ),
+        (
+            lambda self: self.jsoncol.contains(self.any_),
+            "test_table.test_column @> ANY (ARRAY[%(param_1)s])",
         ),
         (
             lambda self: self.jsoncol.contained_by({"foo": "1", "bar": None}),
-            "test_table.test_column <@ %(test_column_1)s",
+            "test_table.test_column <@ %(test_column_1)s::JSONB",
+        ),
+        (
+            lambda self: self.jsoncol.contained_by(self.any_),
+            "test_table.test_column <@ ANY (ARRAY[%(param_1)s])",
         ),
         (
             lambda self: self.jsoncol.delete_path(["a", "b"]),
@@ -5698,11 +6258,20 @@ class JSONBTest(JSONTest):
             "test_table.test_column @? %(test_column_1)s",
         ),
         (
+            lambda self: self.jsoncol.path_exists(self.any_),
+            "test_table.test_column @? ANY (ARRAY[%(param_1)s])",
+        ),
+        (
             lambda self: self.jsoncol.path_match("$.k1[0] > 2"),
             "test_table.test_column @@ %(test_column_1)s",
         ),
+        (
+            lambda self: self.jsoncol.path_match(self.any_),
+            "test_table.test_column @@ ANY (ARRAY[%(param_1)s])",
+        ),
+        id_="as",
     )
-    def test_where(self, whereclause_fn, expected):
+    def test_where_jsonb(self, whereclause_fn, expected):
         super().test_where(whereclause_fn, expected)
 
 
@@ -5754,3 +6323,304 @@ class JSONBCastSuiteTest(suite.JSONLegacyStringCastIndexTest):
     __requires__ = ("postgresql_jsonb",)
 
     datatype = JSONB
+
+
+class CITextTest(testing.AssertsCompiledSQL, fixtures.TablesTest):
+    __requires__ = ("citext",)
+    __only_on__ = "postgresql"
+    __backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "ci_test_table",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("caseignore_text", CITEXT),
+        )
+
+    @testing.variation(
+        "inserts",
+        ["multiple", "single", "insertmanyvalues", "imv_deterministic"],
+    )
+    def test_citext_round_trip(self, connection, inserts):
+        ci_test_table = self.tables.ci_test_table
+
+        data = [
+            {"caseignore_text": "Hello World"},
+            {"caseignore_text": "greetings all"},
+        ]
+
+        if inserts.single:
+            for d in data:
+                connection.execute(
+                    ci_test_table.insert(),
+                    d,
+                )
+        elif inserts.multiple:
+            connection.execute(ci_test_table.insert(), data)
+        elif inserts.insertmanyvalues:
+            result = connection.execute(
+                ci_test_table.insert().returning(ci_test_table.c.id), data
+            )
+            result.all()
+        elif inserts.imv_deterministic:
+            result = connection.execute(
+                ci_test_table.insert().returning(
+                    ci_test_table.c.id, sort_by_parameter_order=True
+                ),
+                data,
+            )
+            result.all()
+        else:
+            inserts.fail()
+
+        ret = connection.execute(
+            select(func.count(ci_test_table.c.id)).where(
+                ci_test_table.c.caseignore_text == "hello world"
+            )
+        ).scalar()
+
+        eq_(ret, 1)
+
+        ret = connection.execute(
+            select(func.count(ci_test_table.c.id)).where(
+                ci_test_table.c.caseignore_text == "Greetings All"
+            )
+        ).scalar()
+
+        eq_(ret, 1)
+
+
+class CITextCastTest(testing.AssertsCompiledSQL, fixtures.TestBase):
+    @testing.combinations(
+        (psycopg.dialect(),),
+        (psycopg2.dialect(),),
+        (asyncpg.dialect(),),
+        (pg8000.dialect(),),
+    )
+    def test_cast(self, dialect):
+        ci_test_table = Table(
+            "ci_test_table",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("caseignore_text", CITEXT),
+        )
+
+        stmt = select(ci_test_table).where(
+            ci_test_table.c.caseignore_text == "xyz"
+        )
+
+        param = {
+            "format": "%s",
+            "numeric_dollar": "$1",
+            "pyformat": "%(caseignore_text_1)s",
+        }[dialect.paramstyle]
+        expected = (
+            "SELECT ci_test_table.id, ci_test_table.caseignore_text "
+            "FROM ci_test_table WHERE "
+            # currently CITEXT has render_bind_cast turned off.
+            # if there's a need to turn it on, change as follows:
+            # f"ci_test_table.caseignore_text = {param}::CITEXT"
+            f"ci_test_table.caseignore_text = {param}"
+        )
+        self.assert_compile(stmt, expected, dialect=dialect)
+
+
+class InetRoundTripTests(fixtures.TestBase):
+    __backend__ = True
+    __only_on__ = "postgresql"
+
+    def _combinations():
+        return testing.combinations(
+            (
+                postgresql.INET,
+                lambda: [
+                    "1.1.1.1",
+                    "192.168.1.1",
+                    "10.1.2.25",
+                    "192.168.22.5",
+                ],
+                IPv4Address,
+            ),
+            (
+                postgresql.INET,
+                lambda: [
+                    "2001:db8::1000",
+                ],
+                IPv6Address,
+            ),
+            (
+                postgresql.CIDR,
+                lambda: [
+                    "10.0.0.0/8",
+                    "192.168.1.0/24",
+                    "192.168.0.0/16",
+                    "192.168.1.25/32",
+                ],
+                IPv4Network,
+            ),
+            (
+                postgresql.CIDR,
+                lambda: [
+                    "::ffff:1.2.3.0/120",
+                ],
+                IPv6Network,
+            ),
+            argnames="datatype,values,pytype",
+        )
+
+    @_combinations()
+    def test_default_native_inet_types(
+        self, datatype, values, pytype, connection, metadata
+    ):
+        t = Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", datatype),
+        )
+        metadata.create_all(connection)
+
+        connection.execute(
+            t.insert(),
+            [
+                {"id": i, "data": val}
+                for i, val in enumerate(values(), start=1)
+            ],
+        )
+
+        if testing.against(["+psycopg", "+asyncpg"]) or (
+            testing.against("+pg8000")
+            and issubclass(datatype, postgresql.INET)
+        ):
+            eq_(
+                connection.scalars(select(t.c.data).order_by(t.c.id)).all(),
+                [pytype(val) for val in values()],
+            )
+        else:
+            eq_(
+                connection.scalars(select(t.c.data).order_by(t.c.id)).all(),
+                values(),
+            )
+
+    @_combinations()
+    def test_str_based_inet_handlers(
+        self, datatype, values, pytype, testing_engine, metadata
+    ):
+        t = Table(
+            "t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", datatype),
+        )
+
+        e = testing_engine(options={"native_inet_types": False})
+        with e.begin() as connection:
+            metadata.create_all(connection)
+
+            connection.execute(
+                t.insert(),
+                [
+                    {"id": i, "data": val}
+                    for i, val in enumerate(values(), start=1)
+                ],
+            )
+
+        with e.connect() as connection:
+            eq_(
+                connection.scalars(select(t.c.data).order_by(t.c.id)).all(),
+                values(),
+            )
+
+    @testing.only_on("+psycopg2")
+    def test_not_impl_psycopg2(self, testing_engine):
+        with expect_raises_message(
+            NotImplementedError,
+            "The psycopg2 dialect does not implement ipaddress type handling",
+        ):
+            testing_engine(options={"native_inet_types": True})
+
+    @testing.only_on("+pg8000")
+    def test_not_impl_pg8000(self, testing_engine):
+        with expect_raises_message(
+            NotImplementedError,
+            "The pg8000 dialect does not fully implement "
+            "ipaddress type handling",
+        ):
+            testing_engine(options={"native_inet_types": True})
+
+
+class PGInsertManyValuesTest(fixtures.TestBase):
+    """test pg-specific types for insertmanyvalues"""
+
+    __only_on__ = "postgresql"
+    __backend__ = True
+
+    @testing.combinations(
+        ("BYTEA", BYTEA(), b"7\xe7\x9f"),
+        ("BIT", BIT(3), "011"),
+        argnames="type_,value",
+        id_="iaa",
+    )
+    @testing.variation("sort_by_parameter_order", [True, False])
+    @testing.variation("multiple_rows", [True, False])
+    @testing.requires.insert_returning
+    def test_imv_returning_datatypes(
+        self,
+        connection,
+        metadata,
+        sort_by_parameter_order,
+        type_,
+        value,
+        multiple_rows,
+    ):
+        """test #9739, #9808 (similar to #9701) for PG specific types
+
+        this tests insertmanyvalues in conjunction with various datatypes.
+
+        These tests are particularly for the asyncpg driver which needs
+        most types to be explicitly cast for the new IMV format
+
+        """
+        t = Table(
+            "d_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("value", type_),
+        )
+
+        t.create(connection)
+
+        if type_._type_affinity is BIT and testing.against("+asyncpg"):
+            import asyncpg
+
+            value = asyncpg.BitString(value)
+
+        result = connection.execute(
+            t.insert().returning(
+                t.c.id,
+                t.c.value,
+                sort_by_parameter_order=bool(sort_by_parameter_order),
+            ),
+            (
+                [{"value": value} for i in range(10)]
+                if multiple_rows
+                else {"value": value}
+            ),
+        )
+
+        if multiple_rows:
+            i_range = range(1, 11)
+        else:
+            i_range = range(1, 2)
+
+        eq_(
+            set(result),
+            {(id_, value) for id_ in i_range},
+        )
+
+        eq_(
+            set(connection.scalars(select(t.c.value))),
+            {value},
+        )

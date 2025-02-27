@@ -13,6 +13,8 @@ from sqlalchemy import MetaData
 from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.sql import literal_column
 from sqlalchemy.sql import select
@@ -115,8 +117,6 @@ class DDLTest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_literal_binds_pgarray(self):
-        from sqlalchemy.dialects.postgresql import ARRAY, array
-
         m = MetaData()
         t = Table(
             "t",
@@ -983,7 +983,11 @@ class PKDefaultTest(fixtures.TestBase):
                 metadata,
                 Column(
                     "date_id",
-                    DateTime(timezone=True),
+                    # we want no tzinfo normally since pymssql doesn't do
+                    # it right now
+                    DateTime().with_variant(
+                        DateTime(timezone=True), "postgresql"
+                    ),
                     default=text("current_timestamp"),
                     primary_key=True,
                 ),
@@ -1093,7 +1097,6 @@ class PKIncrementTest(fixtures.TablesTest):
 
 
 class AutoIncrementTest(fixtures.TestBase):
-
     __backend__ = True
 
     @testing.requires.empty_inserts
@@ -1229,9 +1232,20 @@ class AutoIncrementTest(fixtures.TestBase):
             1,
         )
 
+    @testing.combinations(
+        sa.Float, sa.DOUBLE_PRECISION, sa.Numeric, sa.Numeric(asdecimal=False)
+    )
+    def test_autoincrement_not_float(self, type_):
+        t = Table(
+            "table", sa.MetaData(), Column("col", type_, primary_key=True)
+        )
+
+        eq_(t.autoincrement_column, None)
+        eq_(t.primary_key._autoincrement_column, None)
+        eq_(t.c.col.autoincrement, "auto")
+
 
 class SpecialTypePKTest(fixtures.TestBase):
-
     """test process_result_value in conjunction with primary key columns.
 
     Also tests that "autoincrement" checks are against
@@ -1562,6 +1576,7 @@ class CurrentParametersTest(fixtures.TablesTest):
 
         some_table = self.tables.some_table
         some_table.c.x.default.arg = gen_default
+        some_table.c.x._reset_memoizations()
         return fn
 
     @testing.combinations(

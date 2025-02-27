@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy import String
 from sqlalchemy import testing
 from sqlalchemy import union
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import backref
 from sqlalchemy.orm import column_property
 from sqlalchemy.orm import composite
@@ -28,6 +29,7 @@ from sqlalchemy.testing import fixtures
 from sqlalchemy.testing.assertions import expect_raises_message
 from sqlalchemy.testing.assertsql import AllOf
 from sqlalchemy.testing.assertsql import CompiledSQL
+from sqlalchemy.testing.assertsql import Conditional
 from sqlalchemy.testing.assertsql import EachOf
 from sqlalchemy.testing.assertsql import Or
 from sqlalchemy.testing.entities import ComparableEntity
@@ -279,8 +281,7 @@ class FixtureLoadTest(_Polymorphic, testing.AssertsExecutionResults):
                 CompiledSQL(
                     "SELECT managers.person_id AS managers_person_id, "
                     "people.person_id AS people_person_id, "
-                    "people.company_id AS people_company_id, "
-                    "people.name AS people_name, people.type AS people_type, "
+                    "people.type AS people_type, "
                     "managers.status AS managers_status, "
                     "managers.manager_name AS managers_manager_name "
                     "FROM people JOIN managers "
@@ -292,8 +293,7 @@ class FixtureLoadTest(_Polymorphic, testing.AssertsExecutionResults):
                 CompiledSQL(
                     "SELECT engineers.person_id AS engineers_person_id, "
                     "people.person_id AS people_person_id, "
-                    "people.company_id AS people_company_id, "
-                    "people.name AS people_name, people.type AS people_type, "
+                    "people.type AS people_type, "
                     "engineers.status AS engineers_status, "
                     "engineers.engineer_name AS engineers_engineer_name, "
                     "engineers.primary_language AS engineers_primary_language "
@@ -301,6 +301,80 @@ class FixtureLoadTest(_Polymorphic, testing.AssertsExecutionResults):
                     "ON people.person_id = engineers.person_id "
                     "WHERE people.person_id IN (__[POSTCOMPILE_primary_keys]) "
                     "ORDER BY people.person_id",
+                    {"primary_keys": [1, 2, 5]},
+                ),
+            ),
+        )
+        eq_(result, [self.c1, self.c2])
+
+    def test_load_company_plus_employees_w_paperwork(self):
+        s = fixture_session()
+        q = (
+            s.query(Company)
+            .options(
+                selectinload(Company.employees).options(
+                    selectin_polymorphic(Person, [Engineer, Manager]),
+                    selectinload(Engineer.machines),
+                    # NOTE: if this is selectinload(Person.paperwork),
+                    # we get duplicate loads from the subclasses which is
+                    # not ideal
+                )
+            )
+            .order_by(Company.company_id)
+        )
+
+        result = self.assert_sql_execution(
+            testing.db,
+            q.all,
+            CompiledSQL(
+                "SELECT companies.company_id AS companies_company_id, "
+                "companies.name AS companies_name FROM companies "
+                "ORDER BY companies.company_id",
+                {},
+            ),
+            CompiledSQL(
+                "SELECT people.company_id AS people_company_id, "
+                "people.person_id AS people_person_id, "
+                "people.name AS people_name, people.type AS people_type "
+                "FROM people WHERE people.company_id "
+                "IN (__[POSTCOMPILE_primary_keys]) "
+                "ORDER BY people.person_id",
+                {"primary_keys": [1, 2]},
+            ),
+            AllOf(
+                CompiledSQL(
+                    "SELECT managers.person_id AS managers_person_id, "
+                    "people.person_id AS people_person_id, "
+                    "people.type AS people_type, "
+                    "managers.status AS managers_status, "
+                    "managers.manager_name AS managers_manager_name "
+                    "FROM people JOIN managers "
+                    "ON people.person_id = managers.person_id "
+                    "WHERE people.person_id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY people.person_id",
+                    {"primary_keys": [3, 4]},
+                ),
+                CompiledSQL(
+                    "SELECT engineers.person_id AS engineers_person_id, "
+                    "people.person_id AS people_person_id, "
+                    "people.type AS people_type, "
+                    "engineers.status AS engineers_status, "
+                    "engineers.engineer_name AS engineers_engineer_name, "
+                    "engineers.primary_language AS engineers_primary_language "
+                    "FROM people JOIN engineers "
+                    "ON people.person_id = engineers.person_id "
+                    "WHERE people.person_id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY people.person_id",
+                    {"primary_keys": [1, 2, 5]},
+                ),
+                CompiledSQL(
+                    "SELECT machines.engineer_id AS machines_engineer_id, "
+                    "machines.machine_id AS machines_machine_id, "
+                    "machines.name AS machines_name "
+                    "FROM machines "
+                    "WHERE machines.engineer_id "
+                    "IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY machines.machine_id",
                     {"primary_keys": [1, 2, 5]},
                 ),
             ),
@@ -372,6 +446,238 @@ class TestGeometries(GeometryFixtureBase):
         with self.assert_statement_count(testing.db, 0):
             eq_(result, [d(d_data="d1"), e(e_data="e1")])
 
+    @testing.fixture
+    def threelevel_all_selectin_fixture(self):
+        self._fixture_from_geometry(
+            {
+                "a": {
+                    "subclasses": {
+                        "b": {"polymorphic_load": "selectin"},
+                        "c": {
+                            "subclasses": {
+                                "d": {
+                                    "polymorphic_load": "selectin",
+                                },
+                                "e": {
+                                    "polymorphic_load": "selectin",
+                                },
+                                "f": {},
+                            },
+                            "polymorphic_load": "selectin",
+                        },
+                    }
+                }
+            }
+        )
+
+    def test_threelevel_all_selectin_l1_load_l3(
+        self, threelevel_all_selectin_fixture
+    ):
+        """test for #9373 - load base to receive level 3 endpoints"""
+
+        a, b, c, d, e = self.classes("a", "b", "c", "d", "e")
+        sess = fixture_session()
+        sess.add_all(
+            [d(c_data="cd1", d_data="d1"), e(c_data="ce1", e_data="e1")]
+        )
+        sess.commit()
+
+        for i in range(3):
+            sess.close()
+
+            q = sess.query(a)
+
+            result = self.assert_sql_execution(
+                testing.db,
+                q.all,
+                CompiledSQL(
+                    "SELECT a.id AS a_id, a.type AS a_type, "
+                    "a.a_data AS a_a_data FROM a",
+                    {},
+                ),
+                CompiledSQL(
+                    "SELECT d.id AS d_id, c.id AS c_id, a.id AS a_id, "
+                    "a.type AS a_type, c.c_data AS c_c_data, "
+                    "d.d_data AS d_d_data "
+                    "FROM a JOIN c ON a.id = c.id JOIN d ON c.id = d.id "
+                    "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY a.id",
+                    [{"primary_keys": [1]}],
+                ),
+                CompiledSQL(
+                    "SELECT e.id AS e_id, c.id AS c_id, a.id AS a_id, "
+                    "a.type AS a_type, c.c_data AS c_c_data, "
+                    "e.e_data AS e_e_data "
+                    "FROM a JOIN c ON a.id = c.id JOIN e ON c.id = e.id "
+                    "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY a.id",
+                    [{"primary_keys": [2]}],
+                ),
+            )
+            with self.assert_statement_count(testing.db, 0):
+                eq_(
+                    result,
+                    [
+                        d(c_data="cd1", d_data="d1"),
+                        e(c_data="ce1", e_data="e1"),
+                    ],
+                )
+
+    def test_threelevel_partial_selectin_l1_load_l3(
+        self, threelevel_all_selectin_fixture
+    ):
+        """test for #9373 - load base to receive level 3 endpoints"""
+
+        a, b, c, d, f = self.classes("a", "b", "c", "d", "f")
+        sess = fixture_session()
+        sess.add_all(
+            [d(c_data="cd1", d_data="d1"), f(c_data="ce1", f_data="e1")]
+        )
+        sess.commit()
+
+        for i in range(3):
+            sess.close()
+            q = sess.query(a)
+
+            result = self.assert_sql_execution(
+                testing.db,
+                q.all,
+                CompiledSQL(
+                    "SELECT a.id AS a_id, a.type AS a_type, "
+                    "a.a_data AS a_a_data FROM a",
+                    {},
+                ),
+                CompiledSQL(
+                    "SELECT d.id AS d_id, c.id AS c_id, a.id AS a_id, "
+                    "a.type AS a_type, c.c_data AS c_c_data, "
+                    "d.d_data AS d_d_data "
+                    "FROM a JOIN c ON a.id = c.id JOIN d ON c.id = d.id "
+                    "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY a.id",
+                    [{"primary_keys": [1]}],
+                ),
+                # only loads pk 2 - this is the filtering inside of do_load
+                CompiledSQL(
+                    "SELECT c.id AS c_id, a.id AS a_id, a.type AS a_type, "
+                    "c.c_data AS c_c_data "
+                    "FROM a JOIN c ON a.id = c.id "
+                    "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY a.id",
+                    [{"primary_keys": [2]}],
+                ),
+                # no more SQL; if we hit pk 1 again, it would re-do the d here
+            )
+
+            with self.sql_execution_asserter(testing.db) as asserter_:
+                eq_(
+                    result,
+                    [
+                        d(c_data="cd1", d_data="d1"),
+                        f(c_data="ce1", f_data="e1"),
+                    ],
+                )
+
+            # f was told not to load its attrs, so they load here
+            asserter_.assert_(
+                CompiledSQL(
+                    "SELECT f.f_data AS f_f_data FROM f WHERE :param_1 = f.id",
+                    [{"param_1": 2}],
+                ),
+            )
+
+    def test_threelevel_all_selectin_l1_load_l2(
+        self, threelevel_all_selectin_fixture
+    ):
+        """test for #9373 - load base to receive level 2 endpoint"""
+        a, b, c, d, e = self.classes("a", "b", "c", "d", "e")
+        sess = fixture_session()
+        sess.add_all([c(c_data="c1", a_data="a1")])
+        sess.commit()
+
+        q = sess.query(a)
+
+        result = self.assert_sql_execution(
+            testing.db,
+            q.all,
+            CompiledSQL(
+                "SELECT a.id AS a_id, a.type AS a_type, "
+                "a.a_data AS a_a_data FROM a",
+                {},
+            ),
+            CompiledSQL(
+                "SELECT c.id AS c_id, a.id AS a_id, a.type AS a_type, "
+                "c.c_data AS c_c_data FROM a JOIN c ON a.id = c.id "
+                "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) ORDER BY a.id",
+                {"primary_keys": [1]},
+            ),
+        )
+        with self.assert_statement_count(testing.db, 0):
+            eq_(
+                result,
+                [c(c_data="c1", a_data="a1")],
+            )
+
+    @testing.variation("use_aliased_class", [True, False])
+    def test_threelevel_all_selectin_l2_load_l3(
+        self, threelevel_all_selectin_fixture, use_aliased_class
+    ):
+        """test for #9373 - load level 2 endpoing to receive level 3
+        endpoints"""
+        a, b, c, d, e = self.classes("a", "b", "c", "d", "e")
+        sess = fixture_session()
+        sess.add_all(
+            [d(c_data="cd1", d_data="d1"), e(c_data="ce1", e_data="e1")]
+        )
+        sess.commit()
+
+        if use_aliased_class:
+            q = sess.query(aliased(c, flat=True))
+        else:
+            q = sess.query(c)
+        result = self.assert_sql_execution(
+            testing.db,
+            q.all,
+            Conditional(
+                bool(use_aliased_class),
+                [
+                    CompiledSQL(
+                        "SELECT c_1.id AS c_1_id, a_1.id AS a_1_id, "
+                        "a_1.type AS a_1_type, a_1.a_data AS a_1_a_data, "
+                        "c_1.c_data AS c_1_c_data "
+                        "FROM a AS a_1 JOIN c AS c_1 ON a_1.id = c_1.id",
+                        {},
+                    )
+                ],
+                [
+                    CompiledSQL(
+                        "SELECT c.id AS c_id, a.id AS a_id, a.type AS a_type, "
+                        "a.a_data AS a_a_data, c.c_data AS c_c_data "
+                        "FROM a JOIN c ON a.id = c.id",
+                        {},
+                    )
+                ],
+            ),
+            CompiledSQL(
+                "SELECT d.id AS d_id, c.id AS c_id, a.id AS a_id, "
+                "a.type AS a_type, d.d_data AS d_d_data "
+                "FROM a JOIN c ON a.id = c.id JOIN d ON c.id = d.id "
+                "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) ORDER BY a.id",
+                [{"primary_keys": [1]}],
+            ),
+            CompiledSQL(
+                "SELECT e.id AS e_id, c.id AS c_id, a.id AS a_id, "
+                "a.type AS a_type, e.e_data AS e_e_data "
+                "FROM a JOIN c ON a.id = c.id JOIN e ON c.id = e.id "
+                "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) ORDER BY a.id",
+                [{"primary_keys": [2]}],
+            ),
+        )
+        with self.assert_statement_count(testing.db, 0):
+            eq_(
+                result,
+                [d(c_data="cd1", d_data="d1"), e(c_data="ce1", e_data="e1")],
+            )
+
     def test_threelevel_selectin_to_inline_options(self):
         self._fixture_from_geometry(
             {
@@ -429,6 +735,66 @@ class TestGeometries(GeometryFixtureBase):
         with self.assert_statement_count(testing.db, 0):
             eq_(result, [d(d_data="d1"), e(e_data="e1")])
 
+    @testing.variation("include_intermediary_row", [True, False])
+    def test_threelevel_load_only_3lev(self, include_intermediary_row):
+        """test issue #11327"""
+
+        self._fixture_from_geometry(
+            {
+                "a": {
+                    "subclasses": {
+                        "b": {"subclasses": {"c": {}}},
+                    }
+                }
+            }
+        )
+
+        a, b, c = self.classes("a", "b", "c")
+        sess = fixture_session()
+        sess.add(c(a_data="a1", b_data="b1", c_data="c1"))
+        if include_intermediary_row:
+            sess.add(b(a_data="a1", b_data="b1"))
+        sess.commit()
+
+        sess = fixture_session()
+
+        pks = []
+        c_pks = []
+        with self.sql_execution_asserter(testing.db) as asserter:
+
+            for obj in sess.scalars(
+                select(a)
+                .options(selectin_polymorphic(a, classes=[b, c]))
+                .order_by(a.id)
+            ):
+                assert "b_data" in obj.__dict__
+                if isinstance(obj, c):
+                    assert "c_data" in obj.__dict__
+                    c_pks.append(obj.id)
+                pks.append(obj.id)
+
+        asserter.assert_(
+            CompiledSQL(
+                "SELECT a.id, a.type, a.a_data FROM a ORDER BY a.id", {}
+            ),
+            AllOf(
+                CompiledSQL(
+                    "SELECT c.id AS c_id, b.id AS b_id, a.id AS a_id, "
+                    "a.type AS a_type, c.c_data AS c_c_data FROM a JOIN b "
+                    "ON a.id = b.id JOIN c ON b.id = c.id WHERE a.id IN "
+                    "(__[POSTCOMPILE_primary_keys]) ORDER BY a.id",
+                    [{"primary_keys": c_pks}],
+                ),
+                CompiledSQL(
+                    "SELECT b.id AS b_id, a.id AS a_id, a.type AS a_type, "
+                    "b.b_data AS b_b_data FROM a JOIN b ON a.id = b.id "
+                    "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                    "ORDER BY a.id",
+                    [{"primary_keys": pks}],
+                ),
+            ),
+        )
+
     @testing.combinations((True,), (False,))
     def test_threelevel_selectin_to_inline_awkward_alias_options(
         self, use_aliased_class
@@ -446,7 +812,9 @@ class TestGeometries(GeometryFixtureBase):
 
         a, b, c, d, e = self.classes("a", "b", "c", "d", "e")
         sess = fixture_session()
-        sess.add_all([d(d_data="d1"), e(e_data="e1")])
+        sess.add_all(
+            [d(c_data="c1", d_data="d1"), e(c_data="c2", e_data="e1")]
+        )
         sess.commit()
 
         from sqlalchemy import select
@@ -534,6 +902,15 @@ class TestGeometries(GeometryFixtureBase):
                     {},
                 ),
                 AllOf(
+                    # note this query is added due to the fix made in
+                    # #11327
+                    CompiledSQL(
+                        "SELECT c.id AS c_id, a.id AS a_id, a.type AS a_type, "
+                        "c.c_data AS c_c_data FROM a JOIN c ON a.id = c.id "
+                        "WHERE a.id IN (__[POSTCOMPILE_primary_keys]) "
+                        "ORDER BY a.id",
+                        [{"primary_keys": [1, 2]}],
+                    ),
                     CompiledSQL(
                         "SELECT d.id AS d_id, c.id AS c_id, a.id AS a_id, "
                         "a.type AS a_type, d.d_data AS d_d_data FROM a "
@@ -554,7 +931,10 @@ class TestGeometries(GeometryFixtureBase):
             )
 
         with self.assert_statement_count(testing.db, 0):
-            eq_(result, [d(d_data="d1"), e(e_data="e1")])
+            eq_(
+                result,
+                [d(c_data="c1", d_data="d1"), e(c_data="c2", e_data="e1")],
+            )
 
     def test_partial_load_no_invoke_eagers(self):
         # test issue #4199
@@ -595,11 +975,11 @@ class LoaderOptionsTest(
     def setup_classes(cls):
         Base = cls.DeclarativeBasic
 
-        class Parent(fixtures.ComparableEntity, Base):
+        class Parent(ComparableEntity, Base):
             __tablename__ = "parent"
             id = Column(Integer, primary_key=True)
 
-        class Child(fixtures.ComparableEntity, Base):
+        class Child(ComparableEntity, Base):
             __tablename__ = "child"
             id = Column(Integer, primary_key=True)
             parent_id = Column(Integer, ForeignKey("parent.id"))
@@ -616,7 +996,7 @@ class LoaderOptionsTest(
                 "polymorphic_load": "selectin",
             }
 
-        class Other(fixtures.ComparableEntity, Base):
+        class Other(ComparableEntity, Base):
             __tablename__ = "other"
 
             id = Column(Integer, primary_key=True)
@@ -674,7 +1054,6 @@ class LoaderOptionsTest(
                 CompiledSQL(
                     "SELECT child_subclass1.id AS child_subclass1_id, "
                     "child.id AS child_id, "
-                    "child.parent_id AS child_parent_id, "
                     "child.type AS child_type "
                     "FROM child JOIN child_subclass1 "
                     "ON child.id = child_subclass1.id "
@@ -721,7 +1100,7 @@ class LoaderOptionsTest(
             ),
             CompiledSQL(
                 "SELECT child_subclass1.id AS child_subclass1_id, "
-                "child.id AS child_id, child.parent_id AS child_parent_id, "
+                "child.id AS child_id, "
                 "child.type AS child_type, other_1.id AS other_1_id, "
                 "other_1.child_subclass_id AS other_1_child_subclass_id "
                 "FROM child JOIN child_subclass1 "
@@ -1013,7 +1392,6 @@ class NoBaseWPPlusAliasedTest(
 
         registry.metadata.create_all(connection)
         with Session(connection) as sess:
-
             sess.add_all(
                 [
                     A(thing1="thing1_1"),
@@ -1092,18 +1470,10 @@ class NoBaseWPPlusAliasedTest(
 
 
 class CompositeAttributesTest(fixtures.TestBase):
-    @testing.fixture
-    def mapping_fixture(self, registry, connection):
+
+    @testing.fixture(params=("base", "sub"))
+    def mapping_fixture(self, request, registry, connection):
         Base = registry.generate_base()
-
-        class BaseCls(Base):
-            __tablename__ = "base"
-            id = Column(
-                Integer, primary_key=True, test_needs_autoincrement=True
-            )
-            type = Column(String(50))
-
-            __mapper_args__ = {"polymorphic_on": type}
 
         class XYThing:
             def __init__(self, x, y):
@@ -1123,13 +1493,28 @@ class CompositeAttributesTest(fixtures.TestBase):
             def __ne__(self, other):
                 return not self.__eq__(other)
 
+        class BaseCls(Base):
+            __tablename__ = "base"
+            id = Column(
+                Integer, primary_key=True, test_needs_autoincrement=True
+            )
+            type = Column(String(50))
+
+            if request.param == "base":
+                comp1 = composite(
+                    XYThing, Column("x1", Integer), Column("y1", Integer)
+                )
+
+            __mapper_args__ = {"polymorphic_on": type}
+
         class A(ComparableEntity, BaseCls):
             __tablename__ = "a"
             id = Column(ForeignKey(BaseCls.id), primary_key=True)
             thing1 = Column(String(50))
-            comp1 = composite(
-                XYThing, Column("x1", Integer), Column("y1", Integer)
-            )
+            if request.param == "sub":
+                comp1 = composite(
+                    XYThing, Column("x1", Integer), Column("y1", Integer)
+                )
 
             __mapper_args__ = {
                 "polymorphic_identity": "a",

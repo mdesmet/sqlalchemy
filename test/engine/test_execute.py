@@ -34,6 +34,7 @@ from sqlalchemy.engine import BindTyping
 from sqlalchemy.engine import default
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.engine.base import Engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.pool import NullPool
 from sqlalchemy.pool import QueuePool
 from sqlalchemy.sql import column
@@ -50,6 +51,7 @@ from sqlalchemy.testing import is_
 from sqlalchemy.testing import is_false
 from sqlalchemy.testing import is_not
 from sqlalchemy.testing import is_true
+from sqlalchemy.testing.assertions import expect_deprecated
 from sqlalchemy.testing.assertsql import CompiledSQL
 from sqlalchemy.testing.provision import normalize_sequence
 from sqlalchemy.testing.schema import Column
@@ -425,20 +427,24 @@ class ExecuteTest(fixtures.TablesTest):
         # TODO: this test is assuming too much of arbitrary dialects and would
         # be better suited tested against a single mock dialect that does not
         # have any special behaviors
-        with patch.object(
-            testing.db.dialect, "dbapi", Mock(Error=DBAPIError)
-        ), patch.object(
-            testing.db.dialect, "loaded_dbapi", Mock(Error=DBAPIError)
-        ), patch.object(
-            testing.db.dialect, "is_disconnect", lambda *arg: False
-        ), patch.object(
-            testing.db.dialect,
-            "do_execute",
-            Mock(side_effect=NonStandardException),
-        ), patch.object(
-            testing.db.dialect.execution_ctx_cls,
-            "handle_dbapi_exception",
-            Mock(),
+        with (
+            patch.object(testing.db.dialect, "dbapi", Mock(Error=DBAPIError)),
+            patch.object(
+                testing.db.dialect, "loaded_dbapi", Mock(Error=DBAPIError)
+            ),
+            patch.object(
+                testing.db.dialect, "is_disconnect", lambda *arg: False
+            ),
+            patch.object(
+                testing.db.dialect,
+                "do_execute",
+                Mock(side_effect=NonStandardException),
+            ),
+            patch.object(
+                testing.db.dialect.execution_ctx_cls,
+                "handle_dbapi_exception",
+                Mock(),
+            ),
         ):
             with testing.db.connect() as conn:
                 assert_raises(
@@ -636,14 +642,37 @@ class ExecuteTest(fixtures.TablesTest):
             conn.close()
 
     def test_empty_insert(self, connection):
-        """test that execute() interprets [] as a list with no params"""
+        """test that execute() interprets [] as a list with no params and
+        warns since it has nothing to do with such an executemany.
+        """
         users_autoinc = self.tables.users_autoinc
 
-        connection.execute(
-            users_autoinc.insert().values(user_name=bindparam("name", None)),
-            [],
-        )
-        eq_(connection.execute(users_autoinc.select()).fetchall(), [(1, None)])
+        with expect_deprecated(
+            r"Empty parameter sequence passed to execute\(\). "
+            "This use is deprecated and will raise an exception in a "
+            "future SQLAlchemy release"
+        ):
+            connection.execute(
+                users_autoinc.insert().values(
+                    user_name=bindparam("name", None)
+                ),
+                [],
+            )
+
+        eq_(len(connection.execute(users_autoinc.select()).all()), 1)
+
+    @testing.only_on("sqlite")
+    def test_raw_insert_with_empty_list(self, connection):
+        """exec_driver_sql instead does not raise if an empty list is passed.
+        Let the driver do that if it wants to.
+        """
+        conn = connection
+        with expect_raises_message(
+            tsa.exc.ProgrammingError, "Incorrect number of bindings supplied"
+        ):
+            conn.exec_driver_sql(
+                "insert into users (user_id, user_name) values (?, ?)", []
+            )
 
     @testing.only_on("sqlite")
     def test_execute_compiled_favors_compiled_paramstyle(self):
@@ -976,11 +1005,14 @@ class ConvenienceExecuteTest(fixtures.TablesTest):
         engine = engines.testing_engine()
 
         close_mock = Mock()
-        with mock.patch.object(
-            engine._connection_cls,
-            "begin",
-            Mock(side_effect=Exception("boom")),
-        ), mock.patch.object(engine._connection_cls, "close", close_mock):
+        with (
+            mock.patch.object(
+                engine._connection_cls,
+                "begin",
+                Mock(side_effect=Exception("boom")),
+            ),
+            mock.patch.object(engine._connection_cls, "close", close_mock),
+        ):
             with expect_raises_message(Exception, "boom"):
                 with engine.begin():
                     pass
@@ -1250,6 +1282,19 @@ class SchemaTranslateTest(fixtures.TestBase, testing.AssertsExecutionResults):
 
         return t1, t2, t3
 
+    @testing.fixture
+    def same_named_tables(self, metadata, connection):
+        ts1 = Table(
+            "t1", metadata, Column("x", String(10)), schema=config.test_schema
+        )
+        tsnone = Table("t1", metadata, Column("x", String(10)), schema=None)
+
+        metadata.create_all(connection)
+
+        connection.execute(ts1.insert().values(x="ts1"))
+        connection.execute(tsnone.insert().values(x="tsnone"))
+        return ts1, tsnone
+
     def test_create_table(self, plain_tables, connection):
         map_ = {
             None: config.test_schema,
@@ -1283,7 +1328,6 @@ class SchemaTranslateTest(fixtures.TestBase, testing.AssertsExecutionResults):
         )
 
     def test_ddl_hastable(self, plain_tables, connection):
-
         map_ = {
             None: config.test_schema,
             "foo": config.test_schema,
@@ -1404,6 +1448,133 @@ class SchemaTranslateTest(fixtures.TestBase, testing.AssertsExecutionResults):
             CompiledSQL("DELETE FROM __[SCHEMA_bar].t3"),
         )
 
+    def test_schema_translate_map_keys_change_name_added(
+        self, same_named_tables, connection
+    ):
+        """test #10024"""
+
+        metadata = MetaData()
+
+        translate_table = Table(
+            "t1", metadata, Column("x", String(10)), schema=config.test_schema
+        )
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={"schema_translate_map": {"foo": "bar"}},
+            ),
+            "ts1",
+        )
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={
+                    "schema_translate_map": {
+                        "foo": "bar",
+                        config.test_schema: None,
+                    }
+                },
+            ),
+            "tsnone",
+        )
+
+    def test_schema_translate_map_keys_change_name_removed(
+        self, same_named_tables, connection
+    ):
+        """test #10024"""
+
+        metadata = MetaData()
+
+        translate_table = Table(
+            "t1", metadata, Column("x", String(10)), schema=config.test_schema
+        )
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={
+                    "schema_translate_map": {
+                        "foo": "bar",
+                        config.test_schema: None,
+                    }
+                },
+            ),
+            "tsnone",
+        )
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={"schema_translate_map": {"foo": "bar"}},
+            ),
+            "ts1",
+        )
+
+    def test_schema_translate_map_keys_change_none_removed(
+        self, same_named_tables, connection
+    ):
+        """test #10024"""
+
+        connection.engine.clear_compiled_cache()
+
+        metadata = MetaData()
+
+        translate_table = Table("t1", metadata, Column("x", String(10)))
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={
+                    "schema_translate_map": {None: config.test_schema}
+                },
+            ),
+            "ts1",
+        )
+
+        with expect_raises_message(
+            tsa.exc.StatementError,
+            "schema translate map which previously had `None` "
+            "present as a key now no longer has it present",
+        ):
+            connection.scalar(
+                select(translate_table),
+                execution_options={"schema_translate_map": {"foo": "bar"}},
+            ),
+
+    def test_schema_translate_map_keys_change_none_added(
+        self, same_named_tables, connection
+    ):
+        """test #10024"""
+
+        connection.engine.clear_compiled_cache()
+
+        metadata = MetaData()
+
+        translate_table = Table("t1", metadata, Column("x", String(10)))
+
+        eq_(
+            connection.scalar(
+                select(translate_table),
+                execution_options={"schema_translate_map": {"foo": "bar"}},
+            ),
+            "tsnone",
+        )
+
+        with expect_raises_message(
+            tsa.exc.StatementError,
+            "schema translate map which previously did not have `None` "
+            "present as a key now has `None` present; compiled statement may "
+            "lack adequate placeholders.",
+        ):
+            connection.scalar(
+                select(translate_table),
+                execution_options={
+                    "schema_translate_map": {None: config.test_schema}
+                },
+            ),
+
     def test_crud(self, plain_tables, connection):
         # provided by metadata fixture provided by plain_tables fixture
         self.metadata.create_all(connection)
@@ -1465,7 +1636,6 @@ class SchemaTranslateTest(fixtures.TestBase, testing.AssertsExecutionResults):
         )
 
     def test_via_engine(self, plain_tables, metadata):
-
         with config.db.begin() as connection:
             metadata.create_all(connection)
 
@@ -1643,6 +1813,38 @@ class EngineEventsTest(fixtures.TestBase):
         eq_(canary.be2.call_count, 1)
         eq_(canary.be3.call_count, 2)
 
+    @testing.requires.ad_hoc_engines
+    def test_option_engine_registration_issue_one(self):
+        """test #12289"""
+
+        e1 = create_engine(testing.db.url)
+        e2 = e1.execution_options(foo="bar")
+        e3 = e2.execution_options(isolation_level="AUTOCOMMIT")
+
+        eq_(
+            e3._execution_options,
+            {"foo": "bar", "isolation_level": "AUTOCOMMIT"},
+        )
+
+    @testing.requires.ad_hoc_engines
+    def test_option_engine_registration_issue_two(self):
+        """test #12289"""
+
+        e1 = create_engine(testing.db.url)
+        e2 = e1.execution_options(foo="bar")
+
+        @event.listens_for(e2, "engine_connect")
+        def r1(*arg, **kw):
+            pass
+
+        e3 = e2.execution_options(bat="hoho")
+
+        @event.listens_for(e3, "engine_connect")
+        def r2(*arg, **kw):
+            pass
+
+        eq_(e3._execution_options, {"foo": "bar", "bat": "hoho"})
+
     def test_emit_sql_in_autobegin(self, testing_engine):
         e1 = testing_engine(config.db_url)
 
@@ -1731,11 +1933,12 @@ class EngineEventsTest(fixtures.TestBase):
             # as part of create
             # note we can't use an event to ensure begin() is not called
             # because create also blocks events from happening
-            with mock.patch.object(
-                e1.dialect, "initialize", side_effect=init
-            ) as m1, mock.patch.object(
-                e1._connection_cls, "begin"
-            ) as begin_mock:
+            with (
+                mock.patch.object(
+                    e1.dialect, "initialize", side_effect=init
+                ) as m1,
+                mock.patch.object(e1._connection_cls, "begin") as begin_mock,
+            ):
 
                 @event.listens_for(e1, "connect", insert=True)
                 def go1(dbapi_conn, xyz):
@@ -1801,13 +2004,10 @@ class EngineEventsTest(fixtures.TestBase):
     def test_new_exec_driver_sql_no_events(self):
         m1 = Mock()
 
-        def select1(db):
-            return str(select(1).compile(dialect=db.dialect))
-
         with testing.db.connect() as conn:
             event.listen(conn, "before_execute", m1.before_execute)
             event.listen(conn, "after_execute", m1.after_execute)
-            conn.exec_driver_sql(select1(testing.db))
+            conn.exec_driver_sql(str(select(1).compile(testing.db)))
         eq_(m1.mock_calls, [])
 
     def test_add_event_after_connect(self, testing_engine):
@@ -1876,7 +2076,6 @@ class EngineEventsTest(fixtures.TestBase):
         stmt = str(select(1).compile(dialect=e1.dialect))
 
         with e1.connect() as conn:
-
             result = conn.exec_driver_sql(stmt)
             eq_(result.scalar(), 1)
 
@@ -2044,8 +2243,8 @@ class EngineEventsTest(fixtures.TestBase):
                 select(1).compile(dialect=e1.dialect), (), {}
             )
 
+    @testing.emits_warning("The garbage collector is trying to clean up")
     def test_execute_events(self):
-
         stmts = []
         cursor_stmts = []
 
@@ -2274,7 +2473,15 @@ class EngineEventsTest(fixtures.TestBase):
     @testing.combinations(True, False, argnames="close")
     def test_close_parameter(self, testing_engine, close):
         eng = testing_engine(
-            options=dict(pool_size=1, max_overflow=0, poolclass=QueuePool)
+            options=dict(
+                pool_size=1,
+                max_overflow=0,
+                poolclass=(
+                    QueuePool
+                    if not testing.db.dialect.is_async
+                    else AsyncAdaptedQueuePool
+                ),
+            )
         )
 
         conn = eng.connect()
@@ -2283,6 +2490,7 @@ class EngineEventsTest(fixtures.TestBase):
 
         eng_copy = copy.copy(eng)
         eng_copy.dispose(close=close)
+
         copy_conn = eng_copy.connect()
         dbapi_conn_two = copy_conn.connection.dbapi_connection
 
@@ -2293,6 +2501,9 @@ class EngineEventsTest(fixtures.TestBase):
             is_not(dbapi_conn_one, conn.connection.dbapi_connection)
         else:
             is_(dbapi_conn_one, conn.connection.dbapi_connection)
+
+        conn.close()
+        copy_conn.close()
 
     def test_retval_flag(self):
         canary = []
@@ -2365,11 +2576,14 @@ class EngineEventsTest(fixtures.TestBase):
         def conn_tracker(conn, opt):
             opt["conn_tracked"] = True
 
-        with mock.patch.object(
-            engine.dialect, "set_connection_execution_options"
-        ) as conn_opt, mock.patch.object(
-            engine.dialect, "set_engine_execution_options"
-        ) as engine_opt:
+        with (
+            mock.patch.object(
+                engine.dialect, "set_connection_execution_options"
+            ) as conn_opt,
+            mock.patch.object(
+                engine.dialect, "set_engine_execution_options"
+            ) as engine_opt,
+        ):
             e2 = engine.execution_options(e1="opt_e1")
             c1 = engine.connect()
             c2 = c1.execution_options(c1="opt_c1")
@@ -2949,7 +3163,6 @@ class HandleErrorTest(fixtures.TestBase):
         with patch.object(
             engine.dialect, "is_disconnect", Mock(return_value=orig_error)
         ):
-
             with engine.connect() as c:
                 try:
                     c.exec_driver_sql("SELECT x FROM nonexistent")
@@ -2989,7 +3202,6 @@ class HandleErrorTest(fixtures.TestBase):
         with patch.object(
             engine.dialect, "is_disconnect", Mock(return_value=orig_error)
         ):
-
             with engine.connect() as c:
                 target_crec = c.connection._connection_record
                 try:
@@ -3030,7 +3242,6 @@ class HandleErrorTest(fixtures.TestBase):
                 assert_raises(MySpecialException, conn.get_isolation_level)
 
     def test_handle_error_not_on_connection(self, connection):
-
         with expect_raises_message(
             tsa.exc.InvalidRequestError,
             r"The handle_error\(\) event hook as of SQLAlchemy 2.0 is "
@@ -3325,11 +3536,12 @@ class OnConnectTest(fixtures.TestBase):
             nonlocal init_connection
             init_connection = connection
 
-        with mock.patch.object(
-            e._connection_cls, "begin"
-        ) as mock_begin, mock.patch.object(
-            e.dialect, "initialize", Mock(side_effect=mock_initialize)
-        ) as mock_init:
+        with (
+            mock.patch.object(e._connection_cls, "begin") as mock_begin,
+            mock.patch.object(
+                e.dialect, "initialize", Mock(side_effect=mock_initialize)
+            ) as mock_init,
+        ):
             conn = e.connect()
 
             eq_(mock_begin.mock_calls, [])
@@ -3516,12 +3728,12 @@ class DialectEventTest(fixtures.TestBase):
             arg[-1].get_result_proxy = Mock(return_value=Mock(context=arg[-1]))
             return retval
 
-        m1.real_do_execute.side_effect = (
-            m1.do_execute.side_effect
-        ) = mock_the_cursor
-        m1.real_do_executemany.side_effect = (
-            m1.do_executemany.side_effect
-        ) = mock_the_cursor
+        m1.real_do_execute.side_effect = m1.do_execute.side_effect = (
+            mock_the_cursor
+        )
+        m1.real_do_executemany.side_effect = m1.do_executemany.side_effect = (
+            mock_the_cursor
+        )
         m1.real_do_execute_no_params.side_effect = (
             m1.do_execute_no_params.side_effect
         ) = mock_the_cursor
@@ -3702,8 +3914,8 @@ class DialectEventTest(fixtures.TestBase):
 
         conn.connection.invalidate(soft=True)
         conn.close()
-        conn = e.connect()
-        eq_(conn.info["boom"], "one")
+        with e.connect() as conn:
+            eq_(conn.info["boom"], "one")
 
     def test_connect_do_connect_info_there_after_invalidate(self):
         # test that info is maintained after the do_connect()
@@ -3720,8 +3932,9 @@ class DialectEventTest(fixtures.TestBase):
         eq_(conn.info["boom"], "one")
 
         conn.connection.invalidate()
-        conn = e.connect()
-        eq_(conn.info["boom"], "one")
+
+        with e.connect() as conn:
+            eq_(conn.info["boom"], "one")
 
 
 class SetInputSizesTest(fixtures.TablesTest):
@@ -3759,12 +3972,16 @@ class SetInputSizesTest(fixtures.TablesTest):
         # "safe" datatypes so that the DBAPI does not actually need
         # setinputsizes() called in order to work.
 
-        with mock.patch.object(
-            engine.dialect, "bind_typing", BindTyping.SETINPUTSIZES
-        ), mock.patch.object(
-            engine.dialect, "do_set_input_sizes", do_set_input_sizes
-        ), mock.patch.object(
-            engine.dialect.execution_ctx_cls, "pre_exec", pre_exec
+        with (
+            mock.patch.object(
+                engine.dialect, "bind_typing", BindTyping.SETINPUTSIZES
+            ),
+            mock.patch.object(
+                engine.dialect, "do_set_input_sizes", do_set_input_sizes
+            ),
+            mock.patch.object(
+                engine.dialect.execution_ctx_cls, "pre_exec", pre_exec
+            ),
         ):
             yield engine, canary
 

@@ -506,7 +506,9 @@ class ExpireTest(_fixtures.FixtureTest):
             users,
             properties={
                 "addresses": relationship(
-                    Address, cascade="all, refresh-expire"
+                    Address,
+                    cascade="all, refresh-expire",
+                    order_by=addresses.c.id,
                 )
             },
         )
@@ -713,7 +715,6 @@ class ExpireTest(_fixtures.FixtureTest):
         sess = fixture_session(autoflush=False)
 
         with self.sql_execution_asserter(testing.db) as asserter:
-
             if case == "contains,joined":
                 a1 = (
                     sess.query(Address)
@@ -1168,7 +1169,6 @@ class ExpireTest(_fixtures.FixtureTest):
                     "with a refresh"
                 ),
             ):
-
                 sess.refresh(u, ["name"])
 
             # id was not expired
@@ -1585,7 +1585,7 @@ class ExpireTest(_fixtures.FixtureTest):
         u1 = sess.query(User).options(defer(User.name)).first()
         assert isinstance(
             attributes.instance_state(u1).callables["name"],
-            strategies.LoadDeferredColumns,
+            strategies._LoadDeferredColumns,
         )
 
         # expire the attr, it gets the InstanceState callable
@@ -1663,64 +1663,6 @@ class ExpireTest(_fixtures.FixtureTest):
         # the expire cancels the undefer
         assert "name" in attributes.instance_state(u1).expired_attributes
         assert "name" not in attributes.instance_state(u1).callables
-
-    def test_state_noload_to_lazy(self):
-        """Behavioral test to verify the current activity of
-        loader callables
-
-        """
-
-        users, Address, addresses, User = (
-            self.tables.users,
-            self.classes.Address,
-            self.tables.addresses,
-            self.classes.User,
-        )
-
-        self.mapper_registry.map_imperatively(
-            User,
-            users,
-            properties={"addresses": relationship(Address, lazy="noload")},
-        )
-        self.mapper_registry.map_imperatively(Address, addresses)
-
-        sess = fixture_session(autoflush=False)
-        u1 = sess.query(User).options(lazyload(User.addresses)).first()
-        assert isinstance(
-            attributes.instance_state(u1).callables["addresses"],
-            strategies.LoadLazyAttribute,
-        )
-        # expire, it goes away from callables as of 1.4 and is considered
-        # to be expired
-        sess.expire(u1)
-
-        assert "addresses" in attributes.instance_state(u1).expired_attributes
-        assert "addresses" not in attributes.instance_state(u1).callables
-
-        # load it
-        sess.query(User).first()
-        assert (
-            "addresses" not in attributes.instance_state(u1).expired_attributes
-        )
-        assert "addresses" not in attributes.instance_state(u1).callables
-
-        sess.expunge_all()
-        u1 = sess.query(User).options(lazyload(User.addresses)).first()
-        sess.expire(u1, ["addresses"])
-        assert (
-            "addresses" not in attributes.instance_state(u1).expired_attributes
-        )
-        assert isinstance(
-            attributes.instance_state(u1).callables["addresses"],
-            strategies.LoadLazyAttribute,
-        )
-
-        # load the attr, goes away
-        u1.addresses
-        assert (
-            "addresses" not in attributes.instance_state(u1).expired_attributes
-        )
-        assert "addresses" not in attributes.instance_state(u1).callables
 
     def test_deferred_expire_w_transient_to_detached(self):
         orders, Order = self.tables.orders, self.classes.Order

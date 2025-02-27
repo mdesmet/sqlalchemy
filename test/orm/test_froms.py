@@ -30,7 +30,7 @@ from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm import Session
-from sqlalchemy.orm.context import ORMSelectCompileState
+from sqlalchemy.orm.context import _ORMSelectCompileState
 from sqlalchemy.sql import column
 from sqlalchemy.sql import table
 from sqlalchemy.sql.selectable import LABEL_STYLE_TABLENAME_PLUS_COL
@@ -528,7 +528,6 @@ class EntityFromSubqueryTest(QueryTest, AssertsCompiledSQL):
         )
 
     def test_no_joinedload(self):
-
         User = self.classes.User
 
         s = fixture_session()
@@ -1023,7 +1022,6 @@ class ColumnAccessTest(QueryTest, AssertsCompiledSQL):
         )
 
     def test_anonymous_expression_plus_flag_aliased_join_newstyle(self):
-
         User = self.classes.User
         Address = self.classes.Address
         addresses = self.tables.addresses
@@ -1733,7 +1731,6 @@ class InstancesTest(QueryTest, AssertsCompiledSQL):
         sess.expunge_all()
 
         def go():
-
             # same as above, except Order is aliased, so two adapters
             # are applied by the eager loader
 
@@ -1896,7 +1893,7 @@ class MixedEntitiesTest(QueryTest, AssertsCompiledSQL):
                 .order_by(User.id)
             )
 
-        compile_state = ORMSelectCompileState.create_for_statement(stmt, None)
+        compile_state = _ORMSelectCompileState.create_for_statement(stmt, None)
         is_(compile_state._primary_entity, None)
 
     def test_column_queries_one(self):
@@ -2331,7 +2328,6 @@ class MixedEntitiesTest(QueryTest, AssertsCompiledSQL):
             q4,
             q5,
         ]:
-
             eq_(
                 q.all(),
                 [
@@ -3916,13 +3912,13 @@ class TestOverlyEagerEquivalentCols(fixtures.MappedTest):
             self.tables.sub1,
         )
 
-        class Base(fixtures.ComparableEntity):
+        class Base(ComparableEntity):
             pass
 
-        class Sub1(fixtures.ComparableEntity):
+        class Sub1(ComparableEntity):
             pass
 
-        class Sub2(fixtures.ComparableEntity):
+        class Sub2(ComparableEntity):
             pass
 
         self.mapper_registry.map_imperatively(
@@ -4092,7 +4088,6 @@ class CorrelateORMTest(fixtures.TestBase, testing.AssertsCompiledSQL):
         Base.registry.dispose()
 
     def _combinations(fn):
-
         return testing.combinations(
             (True,), (False,), argnames="include_property"
         )(

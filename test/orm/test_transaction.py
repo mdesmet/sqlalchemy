@@ -5,7 +5,6 @@ import random
 from typing import Optional
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Column
 from sqlalchemy import event
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import func
@@ -39,6 +38,7 @@ from sqlalchemy.testing import is_not
 from sqlalchemy.testing import mock
 from sqlalchemy.testing.config import Variation
 from sqlalchemy.testing.fixtures import fixture_session
+from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.util import gc_collect
 from test.orm._fixtures import FixtureTest
 
@@ -108,7 +108,7 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
         trans.commit()
         assert len(sess.query(User).all()) == 1
 
-    @testing.variation(
+    join_transaction_mode = testing.variation(
         "join_transaction_mode",
         [
             "none",
@@ -118,6 +118,8 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
             "rollback_only",
         ],
     )
+
+    @join_transaction_mode
     @testing.variation("operation", ["commit", "close", "rollback", "nothing"])
     @testing.variation("external_state", ["none", "transaction", "savepoint"])
     def test_join_transaction_modes(
@@ -172,7 +174,6 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
                 assert not connection.in_transaction()
 
         elif external_state.transaction:
-
             assert t1 is not None
 
             if (
@@ -243,6 +244,57 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
                 t1.rollback()
         else:
             external_state.fail()
+
+    @join_transaction_mode
+    @testing.variation("operation", ["commit", "close", "rollback"])
+    def test_join_transaction_mode_with_event(
+        self, join_transaction_mode, operation
+    ):
+        eng = engines.testing_engine()
+        eng_conn = None
+        events = []
+
+        @event.listens_for(eng, "commit")
+        def on_commit(conn):
+            events.append("commit")
+
+        @event.listens_for(eng, "rollback")
+        def on_rollback(conn):
+            events.append("rollback")
+
+        @event.listens_for(eng.pool, "checkin")
+        def on_checkin(conn, record):
+            events.append("checkin")
+
+        @event.listens_for(eng, "engine_connect")
+        def make_stat(conn):
+            nonlocal eng_conn
+            eng_conn = conn
+            conn.begin()
+
+        if join_transaction_mode.none:
+            s = Session(eng)
+        else:
+            s = Session(eng, join_transaction_mode=join_transaction_mode.name)
+
+        s.connection()
+
+        expected = []
+        if operation.commit:
+            s.commit()
+            expected.append("commit")
+        elif operation.rollback:
+            s.rollback()
+            expected.append("rollback")
+        elif operation.close:
+            s.close()
+            expected.append("rollback")
+        else:
+            operation.fail()
+        is_(eng_conn.in_transaction(), False)
+
+        expected.append("checkin")
+        eq_(events, expected)
 
     def test_subtransaction_on_external_commit(self, connection_no_trans):
         users, User = self.tables.users, self.classes.User
@@ -619,14 +671,16 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
         def fail(*arg, **kw):
             raise BaseException("some base exception")
 
-        with mock.patch.object(
-            testing.db.dialect, "do_rollback", side_effect=fail
-        ) as fail_mock, mock.patch.object(
-            testing.db.dialect,
-            "do_commit",
-            side_effect=testing.db.dialect.do_commit,
-        ) as succeed_mock:
-
+        with (
+            mock.patch.object(
+                testing.db.dialect, "do_rollback", side_effect=fail
+            ) as fail_mock,
+            mock.patch.object(
+                testing.db.dialect,
+                "do_commit",
+                side_effect=testing.db.dialect.do_commit,
+            ) as succeed_mock,
+        ):
             # sess.begin() -> commit().  why would do_rollback() be called?
             # because of connection pool finalize_fairy *after* the commit.
             # this will cause the conn.close() in session.commit() to fail,
@@ -841,7 +895,10 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
                 return_value=mock.Mock(
                     _is_future=False,
                     execution_options=mock.Mock(
-                        return_value=mock.Mock(_is_future=False)
+                        return_value=mock.Mock(
+                            _is_future=False,
+                            in_transaction=mock.Mock(return_value=False),
+                        )
                     ),
                 )
             )
@@ -859,7 +916,9 @@ class SessionTransactionTest(fixtures.RemovesEvents, FixtureTest):
 
     def test_execution_options_ignored_mid_transaction(self):
         bind = mock.Mock()
-        conn = mock.Mock(engine=bind)
+        conn = mock.Mock(
+            engine=bind, in_transaction=mock.Mock(return_value=False)
+        )
         bind.connect = mock.Mock(return_value=conn)
         sess = Session(bind=bind)
         sess.execute(text("select 1"))
@@ -1009,7 +1068,6 @@ class _LocalFixture(FixtureTest):
 def subtransaction_recipe_one(self):
     @contextlib.contextmanager
     def transaction(session):
-
         if session.in_transaction():
             outermost = False
         else:
@@ -1173,12 +1231,10 @@ class SubtransactionRecipeTest(FixtureTest):
         self.mapper_registry.map_imperatively(User, users)
 
         with fixture_session() as sess:
-
             sess.begin()
             sess.begin_nested()
 
             with subtransaction_recipe(sess):
-
                 sess.add(User(name="u1"))
 
             sess.commit()
@@ -1290,7 +1346,6 @@ class FixtureDataTest(_LocalFixture):
 
 
 class CleanSavepointTest(FixtureTest):
-
     """test the behavior for [ticket:2452] - rollback on begin_nested()
     only expires objects tracked as being modified in that transaction.
 
@@ -2173,7 +2228,6 @@ class ContextManagerPlusFutureTest(FixtureTest):
 class TransactionFlagsTest(fixtures.TestBase):
     def test_in_transaction(self):
         with fixture_session() as s1:
-
             eq_(s1.in_transaction(), False)
 
             trans = s1.begin()
@@ -2233,7 +2287,6 @@ class TransactionFlagsTest(fixtures.TestBase):
 
     def test_in_transaction_nesting(self):
         with fixture_session() as s1:
-
             eq_(s1.in_transaction(), False)
 
             trans = s1.begin()
@@ -2463,7 +2516,11 @@ class JoinIntoAnExternalTransactionFixture:
 
         self.metadata = MetaData()
         self.table = Table(
-            "t1", self.metadata, Column("id", Integer, primary_key=True)
+            "t1",
+            self.metadata,
+            Column(
+                "id", Integer, primary_key=True, test_needs_autoincrement=True
+            ),
         )
         with self.connection.begin():
             self.table.create(self.connection, checkfirst=True)
@@ -2632,12 +2689,14 @@ class ReallyNewJoinIntoAnExternalTransactionTest(
 
         self.session = Session(
             self.connection,
-            join_transaction_mode="create_savepoint"
-            if (
-                self.join_mode.create_savepoint
-                or self.join_mode.create_savepoint_w_savepoint
-            )
-            else "conditional_savepoint",
+            join_transaction_mode=(
+                "create_savepoint"
+                if (
+                    self.join_mode.create_savepoint
+                    or self.join_mode.create_savepoint_w_savepoint
+                )
+                else "conditional_savepoint"
+            ),
         )
 
     def teardown_session(self):
@@ -2685,7 +2744,6 @@ class LegacyJoinIntoAnExternalTransactionTest(
             @event.listens_for(self.session, "after_transaction_end")
             def restart_savepoint(session, transaction):
                 if transaction.nested and not transaction._parent.nested:
-
                     # ensure that state is expired the way
                     # session.commit() at the top level normally does
                     # (optional step)

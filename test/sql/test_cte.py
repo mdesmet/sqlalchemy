@@ -8,6 +8,7 @@ from sqlalchemy import Table
 from sqlalchemy import testing
 from sqlalchemy import text
 from sqlalchemy import true
+from sqlalchemy import union_all
 from sqlalchemy import update
 from sqlalchemy.dialects import mssql
 from sqlalchemy.engine import default
@@ -18,6 +19,7 @@ from sqlalchemy.sql import column
 from sqlalchemy.sql import cte
 from sqlalchemy.sql import exists
 from sqlalchemy.sql import func
+from sqlalchemy.sql import insert
 from sqlalchemy.sql import literal
 from sqlalchemy.sql import select
 from sqlalchemy.sql import table
@@ -32,7 +34,6 @@ from sqlalchemy.testing import fixtures
 
 
 class CTETest(fixtures.TestBase, AssertsCompiledSQL):
-
     __dialect__ = "default_enhanced"
 
     def test_nonrecursive(self):
@@ -296,7 +297,9 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
     def test_recursive_union_no_alias_two(self):
         """
 
-        pg's example::
+        pg's example:
+
+        .. sourcecode:: sql
 
             WITH RECURSIVE t(n) AS (
                 VALUES (1)
@@ -490,14 +493,20 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     @testing.combinations(True, False, argnames="identical")
-    @testing.combinations(True, False, argnames="use_clone")
-    def test_conflicting_names(self, identical, use_clone):
+    @testing.variation("clone_type", ["none", "clone", "annotated"])
+    def test_conflicting_names(self, identical, clone_type):
         """test a flat out name conflict."""
 
         s1 = select(1)
         c1 = s1.cte(name="cte1", recursive=True)
-        if use_clone:
+        if clone_type.clone:
             c2 = c1._clone()
+            if not identical:
+                c2 = c2.union(select(2))
+        elif clone_type.annotated:
+            # this does not seem to trigger the issue that was fixed in
+            # #12364 howver is still a worthy test
+            c2 = c1._annotate({"foo": "bar"})
             if not identical:
                 c2 = c2.union(select(2))
         else:
@@ -509,18 +518,52 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
 
         s = select(c1, c2)
 
-        if use_clone and identical:
+        if clone_type.clone and identical:
             self.assert_compile(
                 s,
                 'WITH RECURSIVE cte1("1") AS (SELECT 1) SELECT cte1.1, '
                 'cte1.1 AS "1_1" FROM cte1',
             )
+        elif clone_type.annotated and identical:
+            # annotated seems to have a slightly different rendering
+            # scheme here
+            self.assert_compile(
+                s,
+                'WITH RECURSIVE cte1("1") AS (SELECT 1) SELECT cte1.1, '
+                'cte1.1 AS "1__1" FROM cte1',
+            )
         else:
             assert_raises_message(
                 CompileError,
-                "Multiple, unrelated CTEs found " "with the same name: 'cte1'",
+                "Multiple, unrelated CTEs found with the same name: 'cte1'",
                 s.compile,
             )
+
+    @testing.variation("annotated", [True, False])
+    def test_cte_w_annotated(self, annotated):
+        """test #12364"""
+
+        A = table("a", column("i"), column("j"))
+        B = table("b", column("i"), column("j"))
+
+        a = select(A).where(A.c.i > A.c.j).cte("filtered_a")
+
+        if annotated:
+            a = a._annotate({"foo": "bar"})
+
+        a1 = select(a.c.i, literal(1).label("j"))
+        b = select(B).join(a, a.c.i == B.c.i).where(B.c.j.is_not(None))
+
+        query = union_all(a1, b)
+        self.assert_compile(
+            query,
+            "WITH filtered_a AS "
+            "(SELECT a.i AS i, a.j AS j FROM a WHERE a.i > a.j) "
+            "SELECT filtered_a.i, :param_1 AS j FROM filtered_a "
+            "UNION ALL SELECT b.i, b.j "
+            "FROM b JOIN filtered_a ON filtered_a.i = b.i "
+            "WHERE b.j IS NOT NULL",
+        )
 
     def test_with_recursive_no_name_currently_buggy(self):
         s1 = select(1)
@@ -613,7 +656,7 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
                 stmt,
                 "WITH anon_1 AS (SELECT test.a AS b FROM test %s b) "
                 "SELECT (SELECT anon_1.b FROM anon_1) AS c"
-                % ("ORDER BY" if order_by == "order_by" else "GROUP BY")
+                % ("ORDER BY" if order_by == "order_by" else "GROUP BY"),
                 # prior to the fix, the use_object version came out as:
                 # "WITH anon_1 AS (SELECT test.a AS b FROM test "
                 # "ORDER BY test.a) "
@@ -1383,6 +1426,36 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
         else:
             assert False
 
+    @testing.variation("operation", ["insert", "update", "delete"])
+    def test_stringify_standalone_dml_cte(self, operation):
+        """test issue discovered as part of #10753"""
+
+        t1 = table("table_1", column("id"), column("val"))
+
+        if operation.insert:
+            stmt = t1.insert()
+            expected = (
+                "INSERT INTO table_1 (id, val) VALUES (:id, :val) "
+                "RETURNING table_1.id, table_1.val"
+            )
+        elif operation.update:
+            stmt = t1.update()
+            expected = (
+                "UPDATE table_1 SET id=:id, val=:val "
+                "RETURNING table_1.id, table_1.val"
+            )
+        elif operation.delete:
+            stmt = t1.delete()
+            expected = "DELETE FROM table_1 RETURNING table_1.id, table_1.val"
+        else:
+            operation.fail()
+
+        stmt = stmt.returning(t1.c.id, t1.c.val)
+
+        cte = stmt.cte()
+
+        self.assert_compile(cte, expected)
+
     @testing.combinations(
         ("default_enhanced",),
         ("postgresql",),
@@ -1418,6 +1491,31 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
                 "SELECT delete_cte.id, delete_cte.val FROM delete_cte",
                 dialect=dialect,
             )
+
+    def test_insert_update_w_add_cte(self):
+        """test #10408"""
+        a = table(
+            "a", column("id"), column("x"), column("y"), column("next_id")
+        )
+
+        insert_a_cte = (insert(a).values(x=10, y=15).returning(a.c.id)).cte(
+            "insert_a_cte"
+        )
+
+        update_query = (
+            update(a)
+            .values(next_id=insert_a_cte.c.id)
+            .where(a.c.id == 10)
+            .add_cte(insert_a_cte)
+        )
+
+        self.assert_compile(
+            update_query,
+            "WITH insert_a_cte AS (INSERT INTO a (x, y) "
+            "VALUES (:param_1, :param_2) RETURNING a.id) "
+            "UPDATE a SET next_id=insert_a_cte.id "
+            "FROM insert_a_cte WHERE a.id = :id_1",
+        )
 
     def test_anon_update_cte(self):
         orders = table("orders", column("region"))
@@ -1530,7 +1628,6 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
         eq_(stmt.compile().isupdate, False)
 
     def test_pg_example_three(self):
-
         parts = table("parts", column("part"), column("sub_part"))
 
         included_parts = (
@@ -1747,7 +1844,6 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
         )
 
     def test_textual_select_uses_independent_cte_two(self):
-
         foo = table("foo", column("id"))
         bar = table("bar", column("id"), column("attr"), column("foo_id"))
         s1 = select(foo.c.id)
@@ -1990,7 +2086,6 @@ class CTETest(fixtures.TestBase, AssertsCompiledSQL):
 
 
 class NestingCTETest(fixtures.TestBase, AssertsCompiledSQL):
-
     __dialect__ = "default_enhanced"
 
     def test_select_with_nesting_cte_in_cte(self):
@@ -2324,7 +2419,6 @@ class NestingCTETest(fixtures.TestBase, AssertsCompiledSQL):
     def test_nesting_cte_in_recursive_cte_positional(
         self, nesting_cte_in_recursive_cte
     ):
-
         self.assert_compile(
             nesting_cte_in_recursive_cte,
             "WITH RECURSIVE rec_cte(outer_cte) AS (WITH nesting AS "
@@ -2695,7 +2789,6 @@ class NestingCTETest(fixtures.TestBase, AssertsCompiledSQL):
     def test_recursive_nesting_cte_in_recursive_cte_positional(
         self, recursive_nesting_cte_in_recursive_cte
     ):
-
         self.assert_compile(
             recursive_nesting_cte_in_recursive_cte,
             "WITH RECURSIVE rec_cte(outer_cte) AS ("

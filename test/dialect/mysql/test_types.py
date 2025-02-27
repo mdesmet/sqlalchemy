@@ -21,6 +21,7 @@ from sqlalchemy import TypeDecorator
 from sqlalchemy import types as sqltypes
 from sqlalchemy import UnicodeText
 from sqlalchemy.dialects.mysql import base as mysql
+from sqlalchemy.dialects.mysql import mariadb
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
@@ -385,7 +386,7 @@ class TypeCompileTest(fixtures.TestBase, AssertsCompiledSQL):
                 mysql.MSTimeStamp(),
                 DefaultClause(
                     sql.text(
-                        "'1999-09-09 09:09:09' " "ON UPDATE CURRENT_TIMESTAMP"
+                        "'1999-09-09 09:09:09' ON UPDATE CURRENT_TIMESTAMP"
                     )
                 ),
             ],
@@ -398,7 +399,7 @@ class TypeCompileTest(fixtures.TestBase, AssertsCompiledSQL):
                 mysql.MSTimeStamp,
                 DefaultClause(
                     sql.text(
-                        "'1999-09-09 09:09:09' " "ON UPDATE CURRENT_TIMESTAMP"
+                        "'1999-09-09 09:09:09' ON UPDATE CURRENT_TIMESTAMP"
                     )
                 ),
             ],
@@ -410,9 +411,7 @@ class TypeCompileTest(fixtures.TestBase, AssertsCompiledSQL):
             [
                 mysql.MSTimeStamp(),
                 DefaultClause(
-                    sql.text(
-                        "CURRENT_TIMESTAMP " "ON UPDATE CURRENT_TIMESTAMP"
-                    )
+                    sql.text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
                 ),
             ],
             {},
@@ -423,9 +422,7 @@ class TypeCompileTest(fixtures.TestBase, AssertsCompiledSQL):
             [
                 mysql.MSTimeStamp,
                 DefaultClause(
-                    sql.text(
-                        "CURRENT_TIMESTAMP " "ON UPDATE CURRENT_TIMESTAMP"
-                    )
+                    sql.text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
                 ),
             ],
             {"nullable": False},
@@ -462,9 +459,78 @@ class TypeCompileTest(fixtures.TestBase, AssertsCompiledSQL):
             datetime.time(8, 37, 35, 450),
         )
 
+    @testing.combinations(
+        ("sa", sqltypes.Float(), "FLOAT"),
+        ("sa", sqltypes.Double(), "DOUBLE"),
+        ("sa", sqltypes.FLOAT(), "FLOAT"),
+        ("sa", sqltypes.REAL(), "REAL"),
+        ("sa", sqltypes.DOUBLE(), "DOUBLE"),
+        ("sa", sqltypes.DOUBLE_PRECISION(), "DOUBLE PRECISION"),
+        ("mysql", mysql.FLOAT(), "FLOAT"),
+        ("mysql", mysql.DOUBLE(), "DOUBLE"),
+        ("mysql", mysql.REAL(), "REAL"),
+        id_="ira",
+    )
+    def test_float_type_compile(self, type_, sql_text):
+        self.assert_compile(type_, sql_text)
+
+
+class MariaDBUUIDTest(fixtures.TestBase, AssertsCompiledSQL):
+    __only_on__ = "mysql", "mariadb"
+    __backend__ = True
+
+    def test_requirements(self):
+        if testing.against("mariadb>=10.7"):
+            assert testing.requires.uuid_data_type.enabled
+        else:
+            assert not testing.requires.uuid_data_type.enabled
+
+    def test_compile_generic(self):
+        if testing.against("mariadb>=10.7"):
+            self.assert_compile(sqltypes.Uuid(), "UUID")
+        else:
+            self.assert_compile(sqltypes.Uuid(), "CHAR(32)")
+
+    def test_compile_upper(self):
+        self.assert_compile(sqltypes.UUID(), "UUID")
+
+
+class UUIDTest(fixtures.TestBase, AssertsCompiledSQL):
+    @testing.combinations(
+        (sqltypes.Uuid(), (10, 6, 5), "CHAR(32)"),
+        (sqltypes.Uuid(native_uuid=False), (10, 6, 5), "CHAR(32)"),
+        (sqltypes.Uuid(), (10, 7, 0), "UUID"),
+        (sqltypes.Uuid(native_uuid=False), (10, 7, 0), "CHAR(32)"),
+        (sqltypes.UUID(), (10, 6, 5), "UUID"),
+        (sqltypes.UUID(), (10, 7, 0), "UUID"),
+    )
+    def test_mariadb_uuid_combinations(self, type_, version, res):
+        dialect = mariadb.MariaDBDialect()
+        dialect.server_version_info = version
+        dialect.supports_native_uuid = version >= (10, 7)
+        self.assert_compile(type_, res, dialect=dialect)
+
+    @testing.combinations(
+        (sqltypes.Uuid(),),
+        (sqltypes.Uuid(native_uuid=False),),
+    )
+    def test_mysql_uuid_combinations(self, type_):
+        dialect = mysql.MySQLDialect()
+        self.assert_compile(type_, "CHAR(32)", dialect=dialect)
+
+
+class INETMariadbTest(fixtures.TestBase, AssertsCompiledSQL):
+    __dialect__ = mariadb.MariaDBDialect()
+
+    @testing.combinations(
+        (mariadb.INET4(), "INET4"),
+        (mariadb.INET6(), "INET6"),
+    )
+    def test_mariadb_inet6(self, type_, res):
+        self.assert_compile(type_, res)
+
 
 class TypeRoundTripTest(fixtures.TestBase, AssertsExecutionResults):
-
     __dialect__ = mysql.dialect()
     __only_on__ = "mysql", "mariadb"
     __backend__ = True
@@ -552,7 +618,6 @@ class TypeRoundTripTest(fixtures.TestBase, AssertsExecutionResults):
         argnames="store, expected",
     )
     def test_bit_50_roundtrip(self, connection, bit_table, store, expected):
-
         reflected = Table("mysql_bits", MetaData(), autoload_with=connection)
 
         expected = expected or store
@@ -747,7 +812,6 @@ class JSONTest(fixtures.TestBase):
 
     @testing.requires.reflects_json_type
     def test_reflection(self, metadata, connection):
-
         Table("mysql_json", metadata, Column("foo", mysql.JSON))
         metadata.create_all(connection)
 
@@ -772,7 +836,6 @@ class JSONTest(fixtures.TestBase):
 class EnumSetTest(
     fixtures.TestBase, AssertsExecutionResults, AssertsCompiledSQL
 ):
-
     __only_on__ = "mysql", "mariadb"
     __dialect__ = mysql.dialect()
     __backend__ = True
@@ -1198,7 +1261,7 @@ class EnumSetTest(
         t1 = Table("sometable", MetaData(), Column("somecolumn", e1))
         self.assert_compile(
             schema.CreateTable(t1),
-            "CREATE TABLE sometable (somecolumn " "ENUM('x','y','z'))",
+            "CREATE TABLE sometable (somecolumn ENUM('x','y','z'))",
         )
         t1 = Table(
             "sometable",
@@ -1216,7 +1279,6 @@ class EnumSetTest(
         )
 
     def test_enum_parse(self, metadata, connection):
-
         enum_table = Table(
             "mysql_enum",
             metadata,

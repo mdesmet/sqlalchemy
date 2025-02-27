@@ -2,12 +2,16 @@
 
 import datetime
 
+from sqlalchemy import and_
 from sqlalchemy import Column
 from sqlalchemy import DateTime
 from sqlalchemy import event
 from sqlalchemy import ForeignKeyConstraint
+from sqlalchemy import func
+from sqlalchemy import inspect
 from sqlalchemy import Integer
 from sqlalchemy import PrimaryKeyConstraint
+from sqlalchemy import select
 from sqlalchemy import util
 from sqlalchemy.orm import attributes
 from sqlalchemy.orm import object_mapper
@@ -27,7 +31,6 @@ def _is_versioning_col(col):
 
 
 def _history_mapper(local_mapper):
-
     cls = local_mapper.class_
 
     if cls.__dict__.get("_history_mapper_configured", False):
@@ -56,6 +59,10 @@ def _history_mapper(local_mapper):
             local_mapper.local_table.metadata,
             name=local_mapper.local_table.name + "_history",
         )
+        for idx in history_table.indexes:
+            if idx.name is not None:
+                idx.name += "_history"
+            idx.unique = False
 
         for orig_c, history_c in zip(
             local_mapper.local_table.c, history_table.c
@@ -113,7 +120,7 @@ def _history_mapper(local_mapper):
             Column(
                 "changed",
                 DateTime,
-                default=datetime.datetime.utcnow,
+                default=lambda: datetime.datetime.now(datetime.timezone.utc),
                 info=version_meta,
             )
         )
@@ -144,8 +151,39 @@ def _history_mapper(local_mapper):
                 super_history_table.append_column(col)
 
     if not super_mapper:
+
+        def default_version_from_history(context):
+            # Set default value of version column to the maximum of the
+            # version in history columns already present +1
+            # Otherwise re-appearance of deleted rows would cause an error
+            # with the next update
+            current_parameters = context.get_current_parameters()
+            return context.connection.scalar(
+                select(
+                    func.coalesce(func.max(history_table.c.version), 0) + 1
+                ).where(
+                    and_(
+                        *[
+                            history_table.c[c.name]
+                            == current_parameters.get(c.name, None)
+                            for c in inspect(
+                                local_mapper.local_table
+                            ).primary_key
+                        ]
+                    )
+                )
+            )
+
         local_mapper.local_table.append_column(
-            Column("version", Integer, default=1, nullable=False),
+            Column(
+                "version",
+                Integer,
+                # if rows are not being deleted from the main table with
+                # subsequent re-use of primary key, this default can be
+                # "1" instead of running a query per INSERT
+                default=default_version_from_history,
+                nullable=False,
+            ),
             replace_existing=True,
         )
         local_mapper.add_property(
@@ -174,22 +212,22 @@ def _history_mapper(local_mapper):
     else:
         bases = local_mapper.base_mapper.class_.__bases__
 
-    versioned_cls = type.__new__(
-        type,
+    versioned_cls = type(
         "%sHistory" % cls.__name__,
         bases,
-        {"_history_mapper_configured": True},
+        {
+            "_history_mapper_configured": True,
+            "__table__": history_table,
+            "__mapper_args__": dict(
+                inherits=super_history_mapper,
+                polymorphic_identity=local_mapper.polymorphic_identity,
+                polymorphic_on=polymorphic_on,
+                properties=properties,
+            ),
+        },
     )
 
-    m = local_mapper.registry.map_imperatively(
-        versioned_cls,
-        history_table,
-        inherits=super_history_mapper,
-        polymorphic_identity=local_mapper.polymorphic_identity,
-        polymorphic_on=polymorphic_on,
-        properties=properties,
-    )
-    cls.__history_mapper__ = m
+    cls.__history_mapper__ = versioned_cls.__mapper__
 
 
 class Versioned:
@@ -201,9 +239,17 @@ class Versioned:
     are used for new rows even for rows that have been deleted."""
 
     def __init_subclass__(cls) -> None:
-        @event.listens_for(cls, "after_mapper_constructed")
-        def _mapper_constructed(mapper, class_):
-            _history_mapper(mapper)
+        insp = inspect(cls, raiseerr=False)
+
+        if insp is not None:
+            _history_mapper(insp)
+        else:
+
+            @event.listens_for(cls, "after_mapper_constructed")
+            def _mapper_constructed(mapper, class_):
+                _history_mapper(mapper)
+
+        super().__init_subclass__()
 
 
 def versioned_objects(iter_):
